@@ -1,4 +1,5 @@
 // RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -emit-silgen -I %S/Inputs/custom-modules -enable-experimental-concurrency %s -verify | %FileCheck --check-prefix=CHECK --check-prefix=CHECK-%target-cpu %s
+// REQUIRES: concurrency
 // REQUIRES: objc_interop
 
 import Foundation
@@ -76,6 +77,34 @@ class SlowServerlet: SlowServer {
     }
     override func doSomethingDangerousNullably(_ x: String) async throws -> String {
         return x
+    }
+
+    // CHECK-LABEL: sil{{.*}}13SlowServerlet{{.*}}17doSomethingFlaggy{{.*}}To :
+    // CHECK:         try_apply{{.*}}, normal [[NORMAL_BB:bb[0-9]+]], error [[ERROR_BB:bb[0-9]+]]
+    // CHECK:       [[NORMAL_BB]]({{.*}}):
+    // CHECK:         integer_literal {{.*}}0 
+    // CHECK:       [[ERROR_BB]]({{.*}}):
+    // CHECK:         integer_literal {{.*}}1 
+    override func doSomethingFlaggy() async throws -> String {
+        return ""
+    }
+    // CHECK-LABEL: sil{{.*}}13SlowServerlet{{.*}}21doSomethingZeroFlaggy{{.*}}To :
+    // CHECK:         try_apply{{.*}}, normal [[NORMAL_BB:bb[0-9]+]], error [[ERROR_BB:bb[0-9]+]]
+    // CHECK:       [[NORMAL_BB]]({{.*}}):
+    // CHECK:         integer_literal {{.*}}1 
+    // CHECK:       [[ERROR_BB]]({{.*}}):
+    // CHECK:         integer_literal {{.*}}0 
+    override func doSomethingZeroFlaggy() async throws -> String {
+        return ""
+    }
+    // CHECK-LABEL: sil{{.*}}13SlowServerlet{{.*}}28doSomethingMultiResultFlaggy{{.*}}To :
+    // CHECK:         try_apply{{.*}}, normal [[NORMAL_BB:bb[0-9]+]], error [[ERROR_BB:bb[0-9]+]]
+    // CHECK:       [[NORMAL_BB]]({{.*}}):
+    // CHECK:         integer_literal {{.*}}1 
+    // CHECK:       [[ERROR_BB]]({{.*}}):
+    // CHECK:         integer_literal {{.*}}0 
+    override func doSomethingMultiResultFlaggy() async throws -> (String, String) {
+        return ("", "")
     }
 }
 

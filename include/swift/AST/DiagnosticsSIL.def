@@ -43,6 +43,10 @@ ERROR(bridging_objcbridgeable_broken,none,
       "broken definition of '_ObjectiveCBridgeable' protocol: missing %0",
       (DeclName))
 
+ERROR(sil_function_redefinition,none,
+      "multiple definitions of symbol '%0'",
+      (StringRef))
+
 ERROR(invalid_sil_builtin,none,
       "INTERNAL ERROR: invalid use of builtin: %0",
       (StringRef))
@@ -103,8 +107,6 @@ ERROR(objc_selector_malformed,none,"the type ObjectiveC.Selector is malformed",
 // Capture before declaration diagnostics.
 ERROR(capture_before_declaration,none,
       "closure captures %0 before it is declared", (Identifier))
-ERROR(capture_before_declaration_defer,none,
-      "'defer' block captures %0 before it is declared", (Identifier))
 NOTE(captured_value_declared_here,none,
      "captured value declared here", ())
 
@@ -279,6 +281,9 @@ WARNING(switch_on_a_constant,none,
 NOTE(unreachable_code_note,none, "will never be executed", ())
 WARNING(warn_infinite_recursive_call,none,
         "function call causes an infinite recursion", ())
+WARNING(warn_dead_weak_store,none,
+        "weak reference will always be nil because the referenced object is "
+        "deallocated here", ())
 
 // 'transparent' diagnostics
 ERROR(circular_transparent,none,
@@ -435,7 +440,7 @@ ERROR(autodiff_differentiation_module_not_imported,none,
       "Automatic differentiation requires the '_Differentiation' module to be "
       "imported", ())
 ERROR(autodiff_conversion_to_linear_function_not_supported,none,
-      "conversion to '@differentiable(linear)' function type is not yet "
+      "conversion to '@differentiable(_linear)' function type is not yet "
       "supported", ())
 ERROR(autodiff_function_not_differentiable_error,none,
       "function is not differentiable", ())
@@ -644,6 +649,16 @@ NOTE(box_to_stack_cannot_promote_box_to_stack_due_to_escape_location, none,
      "value escapes here", ())
 
 WARNING(semantic_function_improper_nesting, none, "'@_semantics' function calls non-'@_semantics' function with nested '@_semantics' calls", ())
+
+// Capture promotion diagnostics
+WARNING(capturepromotion_concurrentcapture_mutation, none,
+        "'%0' mutated after capture by concurrent closure", (StringRef))
+NOTE(capturepromotion_concurrentcapture_closure_here, none,
+     "variable captured by concurrent closure", ())
+NOTE(capturepromotion_concurrentcapture_capturinguse_here, none,
+     "capturing use", ())
+NOTE(capturepromotion_variable_defined_here,none,
+     "variable defined here", ())
 
 #define UNDEFINE_DIAGNOSTIC_MACROS
 #include "DefineDiagnosticMacros.h"

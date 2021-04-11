@@ -37,7 +37,7 @@ namespace swift {
   class NominalTypeDecl;
   class ValueDecl;
   class SourceLoc;
-  enum class tok;
+  enum class tok : uint8_t;
   enum class AccessorKind;
 
 /// Describes the context in which a name is being printed, which
@@ -355,6 +355,10 @@ void getInheritedForPrinting(const Decl *decl, const PrintOptions &options,
                              llvm::SmallVectorImpl<TypeLoc> &Results);
 
 StringRef getAccessorKindString(AccessorKind value);
+
+bool printCompatibilityFeatureChecksPre(ASTPrinter &printer, Decl *decl);
+void printCompatibilityFeatureChecksPost(ASTPrinter &printer);
+
 } // namespace swift
 
 #endif // LLVM_SWIFT_AST_ASTPRINTER_H

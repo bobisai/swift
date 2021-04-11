@@ -45,7 +45,7 @@ func f1_variadic(x: ()...) { }
 func f1_inout(x: inout ()) { }
 func f1_shared(x: __shared AnyObject) { }
 func f1_owned(x: __owned AnyObject) { }
-
+func f1_takes_concurrent(_: @Sendable () -> Void) { }
 func f2_variadic_inout(x: ()..., y: inout ()) { }
 
 func f1_escaping(_: @escaping (Int) -> Float) { }
@@ -62,7 +62,7 @@ DemangleToMetadataTests.test("function types") {
 #endif
 
   // Async functions
-  expectEqual(type(of: f0_async), _typeByName("yyYc")!)
+  expectEqual(type(of: f0_async), _typeByName("yyYac")!)
 
   // Throwing functions
   expectEqual(type(of: f0_throws), _typeByName("yyKc")!)
@@ -80,6 +80,9 @@ DemangleToMetadataTests.test("function types") {
   // Ownership parameters.
   expectEqual(type(of: f1_shared), _typeByName("yyyXlhc")!)
   expectEqual(type(of: f1_owned), _typeByName("yyyXlnc")!)
+
+  // Concurrent function types.
+  expectEqual(type(of: f1_takes_concurrent), _typeByName("yyyyYbXEc")!)
 
   // Mix-and-match.
   expectEqual(type(of: f2_variadic_inout), _typeByName("yyytd_ytztc")!)
@@ -241,6 +244,11 @@ DemangleToMetadataTests.test("demangle built-in types") {
   expectEqual(Builtin.FPIEEE64.self, _typeByName("Bf64_")!)
 
   expectEqual(Builtin.Vec4xFPIEEE32.self, _typeByName("Bf32_Bv4_")!)
+
+  expectEqual(Builtin.RawUnsafeContinuation.self, _typeByName("Bc")!)
+  expectEqual(Builtin.Executor.self, _typeByName("Be")!)
+  expectNotNil(_typeByName("BD"))
+  expectEqual(Builtin.Job.self, _typeByName("Bj")!)
 }
 
 class CG4<T: P1, U: P2> {

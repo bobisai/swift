@@ -513,7 +513,7 @@ CharSourceRange parameterNameRangeOfCallArg(const TupleExpr *TE,
 static void setDecl(SyntaxStructureNode &N, Decl *D) {
   N.Dcl = D;
   N.Attrs = D->getAttrs();
-  N.DocRange = D->getRawComment().getCharSourceRange();
+  N.DocRange = D->getRawComment(/*SerializedOK=*/false).getCharSourceRange();
 }
 
 } // anonymous namespace
@@ -1620,8 +1620,7 @@ class DocFieldParser {
 
 public:
   DocFieldParser(StringRef text) : ptr(text.begin()), end(text.end()) {
-    assert(text.rtrim().find('\n') == StringRef::npos &&
-           "expected single line");
+    assert(!text.rtrim().contains('\n') && "expected single line");
   }
 
   // Case-insensitively match one of the following patterns:

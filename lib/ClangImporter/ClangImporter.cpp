@@ -15,7 +15,6 @@
 //===----------------------------------------------------------------------===//
 #include "swift/ClangImporter/ClangImporter.h"
 #include "ClangDiagnosticConsumer.h"
-#include "IAMInference.h"
 #include "ImporterImpl.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ClangModuleLoader.h"
@@ -391,9 +390,7 @@ void ClangImporter::Implementation::addBridgeHeaderTopLevelDecls(
   BridgeHeaderTopLevelDecls.push_back(D);
 }
 
-bool ClangImporter::Implementation::shouldIgnoreBridgeHeaderTopLevelDecl(
-    clang::Decl *D) {
-  // Ignore forward references;
+bool importer::isForwardDeclOfType(const clang::Decl *D) {
   if (auto *ID = dyn_cast<clang::ObjCInterfaceDecl>(D)) {
     if (!ID->isThisDeclarationADefinition())
       return true;
@@ -405,6 +402,11 @@ bool ClangImporter::Implementation::shouldIgnoreBridgeHeaderTopLevelDecl(
       return true;
   }
   return false;
+}
+
+bool ClangImporter::Implementation::shouldIgnoreBridgeHeaderTopLevelDecl(
+    clang::Decl *D) {
+  return importer::isForwardDeclOfType(D);
 }
 
 ClangImporter::ClangImporter(ASTContext &ctx,
@@ -821,7 +823,8 @@ bool ClangImporter::canReadPCH(StringRef PCHFilename) {
                              &Impl.Instance->getModuleCache());
   auto invocation =
       std::make_shared<clang::CompilerInvocation>(*Impl.Invocation);
-  invocation->getPreprocessorOpts().DisablePCHValidation = false;
+  invocation->getPreprocessorOpts().DisablePCHOrModuleValidation =
+      clang::DisableValidationForModuleKind::None;
   invocation->getPreprocessorOpts().AllowPCHWithCompilerErrors = false;
   invocation->getHeaderSearchOpts().ModulesValidateSystemHeaders = true;
   invocation->getLangOpts()->NeededByPCHOrCompilationUsesPCH = true;
@@ -1051,8 +1054,7 @@ ClangImporter::create(ASTContext &ctx,
           importer->Impl.BridgingHeaderLookupTable,
           importer->Impl.LookupTables, importer->Impl.SwiftContext,
           importer->Impl.getBufferImporterForDiagnostics(),
-          importer->Impl.platformAvailability,
-          importer->Impl.InferImportAsMember));
+          importer->Impl.platformAvailability));
 
   // Create a compiler instance.
   {
@@ -1168,7 +1170,7 @@ ClangImporter::create(ASTContext &ctx,
 
   importer->Impl.nameImporter.reset(new NameImporter(
       importer->Impl.SwiftContext, importer->Impl.platformAvailability,
-      importer->Impl.getClangSema(), importer->Impl.InferImportAsMember));
+      importer->Impl.getClangSema()));
 
   // FIXME: These decls are not being parsed correctly since (a) some of the
   // callbacks are still being added, and (b) the logic to parse them has
@@ -1362,7 +1364,7 @@ bool ClangImporter::Implementation::importHeader(
   // to correct. The fix would be explicitly importing on the command line.
   if (implicitImport && !allParsedDecls.empty() &&
     BridgingHeaderExplicitlyRequested) {
-    SwiftContext.Diags.diagnose(
+    diagnose(
       diagLoc, diag::implicit_bridging_header_imported_from_module,
       llvm::sys::path::filename(headerName), adapter->getName());
   }
@@ -1397,8 +1399,7 @@ bool ClangImporter::Implementation::importHeader(
 
   // FIXME: What do we do if there was already an error?
   if (!hadError && clangDiags.hasErrorOccurred()) {
-    SwiftContext.Diags.diagnose(diagLoc, diag::bridging_header_error,
-                                headerName);
+    diagnose(diagLoc, diag::bridging_header_error, headerName);
     return true;
   }
 
@@ -1446,8 +1447,7 @@ bool ClangImporter::importBridgingHeader(StringRef header, ModuleDecl *adapter,
   clang::FileManager &fileManager = Impl.Instance->getFileManager();
   auto headerFile = fileManager.getFile(header, /*OpenFile=*/true);
   if (!headerFile) {
-    Impl.SwiftContext.Diags.diagnose(diagLoc, diag::bridging_header_missing,
-                                     header);
+    Impl.diagnose(diagLoc, diag::bridging_header_missing, header);
     return true;
   }
 
@@ -1515,8 +1515,7 @@ std::string ClangImporter::getBridgingHeaderContents(StringRef headerPath,
 
   success |= !rewriteInstance.getDiagnostics().hasErrorOccurred();
   if (!success) {
-    Impl.SwiftContext.Diags.diagnose({},
-                                     diag::could_not_rewrite_bridging_header);
+    Impl.diagnose({}, diag::could_not_rewrite_bridging_header);
     return "";
   }
 
@@ -1603,9 +1602,8 @@ ClangImporter::emitBridgingPCH(StringRef headerPath,
   emitInstance->ExecuteAction(*action);
 
   if (emitInstance->getDiagnostics().hasErrorOccurred()) {
-    Impl.SwiftContext.Diags.diagnose({},
-                                     diag::bridging_header_pch_error,
-                                     outputPCHPath, headerPath);
+    Impl.diagnose({}, diag::bridging_header_pch_error,
+                  outputPCHPath, headerPath);
     return true;
   }
   return false;
@@ -1664,9 +1662,7 @@ bool ClangImporter::emitPrecompiledModule(StringRef moduleMapPath,
   emitInstance->ExecuteAction(*action);
 
   if (emitInstance->getDiagnostics().hasErrorOccurred()) {
-    Impl.SwiftContext.Diags.diagnose({},
-                                     diag::emit_pcm_error,
-                                     outputPath, moduleMapPath);
+    Impl.diagnose({}, diag::emit_pcm_error, outputPath, moduleMapPath);
     return true;
   }
   return false;
@@ -1689,7 +1685,7 @@ bool ClangImporter::dumpPrecompiledModule(StringRef modulePath,
   dumpInstance->ExecuteAction(*action);
 
   if (dumpInstance->getDiagnostics().hasErrorOccurred()) {
-    Impl.SwiftContext.Diags.diagnose({}, diag::dump_pcm_error, modulePath);
+    Impl.diagnose({}, diag::dump_pcm_error, modulePath);
     return true;
   }
   return false;
@@ -1941,17 +1937,25 @@ PlatformAvailability::PlatformAvailability(const LangOptions &langOpts)
   case PlatformKind::tvOSApplicationExtension:
     deprecatedAsUnavailableMessage =
         "APIs deprecated as of iOS 7 and earlier are unavailable in Swift";
+    asyncDeprecatedAsUnavailableMessage =
+      "APIs deprecated as of iOS 12 and earlier are not imported as 'async'";
     break;
 
   case PlatformKind::watchOS:
   case PlatformKind::watchOSApplicationExtension:
     deprecatedAsUnavailableMessage = "";
+    asyncDeprecatedAsUnavailableMessage =
+      "APIs deprecated as of watchOS 5 and earlier are not imported as "
+      "'async'";
     break;
 
   case PlatformKind::macOS:
   case PlatformKind::macOSApplicationExtension:
     deprecatedAsUnavailableMessage =
         "APIs deprecated as of macOS 10.9 and earlier are unavailable in Swift";
+    asyncDeprecatedAsUnavailableMessage =
+      "APIs deprecated as of macOS 10.14 and earlier are not imported as "
+      "'async'";
     break;
 
   case PlatformKind::OpenBSD:
@@ -2008,7 +2012,8 @@ bool PlatformAvailability::isPlatformRelevant(StringRef name) const {
 }
 
 bool PlatformAvailability::treatDeprecatedAsUnavailable(
-    const clang::Decl *clangDecl, const llvm::VersionTuple &version) const {
+    const clang::Decl *clangDecl, const llvm::VersionTuple &version,
+    bool isAsync) const {
   assert(!version.empty() && "Must provide version when deprecated");
   unsigned major = version.getMajor();
   Optional<unsigned> minor = version.getMinor();
@@ -2019,6 +2024,13 @@ bool PlatformAvailability::treatDeprecatedAsUnavailable(
 
   case PlatformKind::macOS:
   case PlatformKind::macOSApplicationExtension:
+    // Anything deprecated by macOS 10.14 is unavailable for async import
+    // in Swift.
+    if (isAsync && !clangDecl->hasAttr<clang::SwiftAsyncAttr>()) {
+      return major < 10 ||
+          (major == 10 && (!minor.hasValue() || minor.getValue() <= 14));
+    }
+
     // Anything deprecated in OSX 10.9.x and earlier is unavailable in Swift.
     return major < 10 ||
            (major == 10 && (!minor.hasValue() || minor.getValue() <= 9));
@@ -2027,6 +2039,12 @@ bool PlatformAvailability::treatDeprecatedAsUnavailable(
   case PlatformKind::iOSApplicationExtension:
   case PlatformKind::tvOS:
   case PlatformKind::tvOSApplicationExtension:
+    // Anything deprecated by iOS 12 is unavailable for async import
+    // in Swift.
+    if (isAsync && !clangDecl->hasAttr<clang::SwiftAsyncAttr>()) {
+      return major <= 12;
+    }
+
     // Anything deprecated in iOS 7.x and earlier is unavailable in Swift.
     return major <= 7;
 
@@ -2037,6 +2055,12 @@ bool PlatformAvailability::treatDeprecatedAsUnavailable(
 
   case PlatformKind::watchOS:
   case PlatformKind::watchOSApplicationExtension:
+    // Anything deprecated by watchOS 5.0 is unavailable for async import
+    // in Swift.
+    if (isAsync && !clangDecl->hasAttr<clang::SwiftAsyncAttr>()) {
+      return major <= 5;
+    }
+
     // No deprecation filter on watchOS
     return false;
 
@@ -2057,7 +2081,6 @@ ClangImporter::Implementation::Implementation(
     DWARFImporterDelegate *dwarfImporterDelegate)
     : SwiftContext(ctx),
       ImportForwardDeclarations(ctx.ClangImporterOpts.ImportForwardDeclarations),
-      InferImportAsMember(ctx.ClangImporterOpts.InferImportAsMember),
       DisableSwiftBridgeAttr(ctx.ClangImporterOpts.DisableSwiftBridgeAttr),
       BridgingHeaderExplicitlyRequested(!ctx.ClangImporterOpts.BridgingHeader.empty()),
       DisableOverlayModules(ctx.ClangImporterOpts.DisableOverlayModules),
@@ -3752,7 +3775,6 @@ void ClangImporter::Implementation::lookupValue(
           clangDecl->getMostRecentDecl();
 
       CurrentVersion.forEachOtherImportNameVersion(
-          SwiftContext.LangOpts.EnableExperimentalConcurrency,
           [&](ImportNameVersion nameVersion) {
         if (anyMatching)
           return;
@@ -4149,4 +4171,26 @@ clang::FunctionDecl *ClangImporter::instantiateCXXFunctionTemplate(
                                                    clang::SourceLocation());
   sema.InstantiateFunctionDefinition(clang::SourceLocation(), spec);
   return spec;
+}
+
+StructDecl *
+ClangImporter::instantiateCXXClassTemplate(
+    clang::ClassTemplateDecl *decl,
+    ArrayRef<clang::TemplateArgument> arguments) {
+  void *InsertPos = nullptr;
+  auto *ctsd = decl->findSpecialization(arguments, InsertPos);
+  if (!ctsd) {
+    ctsd = clang::ClassTemplateSpecializationDecl::Create(
+        decl->getASTContext(), decl->getTemplatedDecl()->getTagKind(),
+        decl->getDeclContext(), decl->getTemplatedDecl()->getBeginLoc(),
+        decl->getLocation(), decl, arguments, nullptr);
+    decl->AddSpecialization(ctsd, InsertPos);
+  }
+
+  auto CanonType = decl->getASTContext().getTypeDeclType(ctsd);
+  assert(isa<clang::RecordType>(CanonType) &&
+          "type of non-dependent specialization is not a RecordType");
+
+  return dyn_cast_or_null<StructDecl>(
+      Impl.importDecl(ctsd, Impl.CurrentVersion));
 }

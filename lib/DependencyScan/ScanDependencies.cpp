@@ -40,6 +40,8 @@
 #include "llvm/Support/YAMLParser.h"
 #include "llvm/Support/YAMLTraits.h"
 #include <set>
+#include <string>
+#include <sstream>
 
 using namespace swift;
 using namespace swift::dependencies;
@@ -916,6 +918,32 @@ using CompilerArgInstanceCacheMap =
     llvm::StringMap<std::pair<std::unique_ptr<CompilerInstance>,
                               std::unique_ptr<ModuleDependenciesCache>>>;
 
+static void updateCachedInstanceOpts(CompilerInstance &cachedInstance,
+                                     const CompilerInstance &invocationInstance,
+                                     llvm::StringRef entryArguments) {
+  cachedInstance.getASTContext().SearchPathOpts =
+      invocationInstance.getASTContext().SearchPathOpts;
+
+  // The Clang Importer arguments must consiste of a combination of
+  // Clang Importer arguments of the current invocation to inherit its Clang-specific
+  // search path options, followed by the options speicific to the given batch-entry,
+  // which may overload some of the invocation's options (e.g. target)
+  cachedInstance.getASTContext().ClangImporterOpts =
+      invocationInstance.getASTContext().ClangImporterOpts;
+  std::istringstream iss(entryArguments.str());
+  std::vector<std::string> splitArguments(
+      std::istream_iterator<std::string>{iss},
+      std::istream_iterator<std::string>());
+  for (auto it = splitArguments.begin(), end = splitArguments.end(); it != end;
+       ++it) {
+    if ((*it) == "-Xcc") {
+      assert((it + 1 != end) && "Expected option following '-Xcc'");
+      cachedInstance.getASTContext().ClangImporterOpts.ExtraArgs.push_back(
+          *(it + 1));
+    }
+  }
+}
+
 static bool
 forEachBatchEntry(CompilerInstance &invocationInstance,
                   ModuleDependenciesCache &invocationCache,
@@ -950,14 +978,15 @@ forEachBatchEntry(CompilerInstance &invocationInstance,
       // before.
       pInstance = (*subInstanceMap)[entry.arguments].first.get();
       pCache = (*subInstanceMap)[entry.arguments].second.get();
-      // We must update the search paths of this instance to instead reflect those of the current
-      // invocation's.
-      for (auto &path : invocationInstance.getASTContext().SearchPathOpts.ImportSearchPaths)
-        pInstance->getASTContext().addSearchPath(path, false, false);
-      for (auto &path : invocationInstance.getASTContext().SearchPathOpts.FrameworkSearchPaths)
-        pInstance->getASTContext().addSearchPath(path.Path, true, path.IsSystem);
-
+      // We must update the search paths of this instance to instead reflect
+      // those of the current scanner invocation.
+      updateCachedInstanceOpts(*pInstance, invocationInstance, entry.arguments);
     } else {
+      // We must reset option occurences because we are handling an unrelated command-line
+      // to those parsed before. We must do so because LLVM options parsing is done
+      // using a managed static `GlobalParser`.
+      llvm::cl::ResetAllOptionOccurrences();
+
       // Create a new instance by the arguments and save it in the map.
       subInstanceMap->insert(
           {entry.arguments,
@@ -1216,7 +1245,8 @@ swift::dependencies::performModuleScan(CompilerInstance &instance,
       /*buildModuleCacheDirIfAbsent*/ false, ModuleCachePath,
       FEOpts.PrebuiltModuleCachePath,
       FEOpts.SerializeModuleInterfaceDependencyHashes,
-      FEOpts.shouldTrackSystemDependencies());
+      FEOpts.shouldTrackSystemDependencies(),
+      RequireOSSAModules_t(instance.getSILOptions()));
 
   // Explore the dependencies of every module.
   for (unsigned currentModuleIdx = 0; currentModuleIdx < allModules.size();
@@ -1307,7 +1337,8 @@ swift::dependencies::performBatchModuleScan(
             /*buildModuleCacheDirIfAbsent*/ false, ModuleCachePath,
             FEOpts.PrebuiltModuleCachePath,
             FEOpts.SerializeModuleInterfaceDependencyHashes,
-            FEOpts.shouldTrackSystemDependencies());
+            FEOpts.shouldTrackSystemDependencies(),
+            RequireOSSAModules_t(instance.getSILOptions()));
         Optional<ModuleDependencies> rootDeps;
         if (isClang) {
           // Loading the clang module using Clang importer.
@@ -1374,7 +1405,8 @@ swift::dependencies::performBatchModulePrescan(
             /*buildModuleCacheDirIfAbsent*/ false, ModuleCachePath,
             FEOpts.PrebuiltModuleCachePath,
             FEOpts.SerializeModuleInterfaceDependencyHashes,
-            FEOpts.shouldTrackSystemDependencies());
+            FEOpts.shouldTrackSystemDependencies(),
+            RequireOSSAModules_t(instance.getSILOptions()));
         Optional<ModuleDependencies> rootDeps;
         if (isClang) {
           // Loading the clang module using Clang importer.

@@ -44,6 +44,7 @@
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/CallingConv.h"
 #include "llvm/IR/Constant.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/Target/TargetMachine.h"
 
@@ -731,13 +732,15 @@ public:
   llvm::PointerType *AsyncFunctionPointerPtrTy;
   llvm::PointerType *SwiftContextPtrTy;
   llvm::PointerType *SwiftTaskPtrTy;
+  llvm::PointerType *SwiftTaskGroupPtrTy;
   llvm::PointerType *SwiftJobPtrTy;
-  llvm::PointerType *SwiftExecutorPtrTy;
+  llvm::PointerType *ExecutorFirstTy;
+  llvm::IntegerType *ExecutorSecondTy;
   llvm::FunctionType *TaskContinuationFunctionTy;
   llvm::PointerType *TaskContinuationFunctionPtrTy;
   llvm::StructType *AsyncTaskAndContextTy;
-  llvm::StructType *AsyncContinuationContextTy;
-  llvm::PointerType *AsyncContinuationContextPtrTy;
+  llvm::StructType *ContinuationAsyncContextTy;
+  llvm::PointerType *ContinuationAsyncContextPtrTy;
   llvm::StructType *DifferentiabilityWitnessTy; // { i8*, i8* }
 
   llvm::GlobalVariable *TheTrivialPropertyDescriptor = nullptr;
@@ -753,6 +756,10 @@ public:
   llvm::CallingConv::ID C_CC;          /// standard C calling convention
   llvm::CallingConv::ID DefaultCC;     /// default calling convention
   llvm::CallingConv::ID SwiftCC;       /// swift calling convention
+  llvm::CallingConv::ID SwiftAsyncCC;  /// swift calling convention for async
+
+  /// What kind of tail call should be used for async->async calls.
+  llvm::CallInst::TailCallKind AsyncTailCallKind;
 
   Signature getAssociatedTypeWitnessTableAccessFunctionSignature();
 
@@ -771,6 +778,7 @@ public:
   Alignment getTypeMetadataAlignment() const {
     return getPointerAlignment();
   }
+  Alignment getAsyncContextAlignment() const;
 
   /// Return the offset, relative to the address point, of the start of the
   /// type-specific members of an enum metadata.
@@ -901,7 +909,7 @@ public:
   const TypeInfo &getTypeMetadataPtrTypeInfo();
   const TypeInfo &getSwiftContextPtrTypeInfo();
   const TypeInfo &getTaskContinuationFunctionPtrTypeInfo();
-  const TypeInfo &getSwiftExecutorPtrTypeInfo();
+  const LoadableTypeInfo &getExecutorTypeInfo();
   const TypeInfo &getObjCClassPtrTypeInfo();
   const LoadableTypeInfo &getOpaqueStorageTypeInfo(Size size, Alignment align);
   const LoadableTypeInfo &
@@ -1062,10 +1070,10 @@ public:
                               SILType objectType, const TypeInfo &objectTI,
                               const OutliningMetadataCollector &collector);
 
-private:
   llvm::Constant *getAddrOfClangGlobalDecl(clang::GlobalDecl global,
                                            ForDefinition_t forDefinition);
 
+private:
   using CopyAddrHelperGenerator =
     llvm::function_ref<void(IRGenFunction &IGF, Address dest, Address src,
                             SILType objectType, const TypeInfo &objectTI)>;
@@ -1288,7 +1296,7 @@ public:
   ClassDecl *getSwiftNativeNSObjectDecl();
   llvm::Module *getModule() const;
   llvm::AttributeList getAllocAttrs();
-
+  llvm::Constant *getDeletedAsyncMethodErrorAsyncFunctionPointer();
   bool isStandardLibrary() const;
 
 private:
@@ -1382,7 +1390,8 @@ public:
   void finalizeClangCodeGen();
   void finishEmitAfterTopLevel();
 
-  Signature getSignature(CanSILFunctionType fnType);
+  Signature getSignature(CanSILFunctionType fnType,
+                         bool suppressGenerics = false);
   llvm::FunctionType *getFunctionType(CanSILFunctionType type,
                                       llvm::AttributeList &attrs,
                                       ForeignFunctionInfo *foreignInfo=nullptr);
@@ -1396,8 +1405,9 @@ public:
   /// Cast the given constant to i8*.
   llvm::Constant *getOpaquePtr(llvm::Constant *pointer);
 
+  llvm::Constant *getAddrOfAsyncFunctionPointer(LinkEntity entity);
   llvm::Constant *getAddrOfAsyncFunctionPointer(SILFunction *function);
-  llvm::Constant *defineAsyncFunctionPointer(SILFunction *function,
+  llvm::Constant *defineAsyncFunctionPointer(LinkEntity entity,
                                              ConstantInit init);
   SILFunction *getSILFunctionForAsyncFunctionPointer(llvm::Constant *afp);
 

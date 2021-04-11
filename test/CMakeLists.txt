@@ -54,7 +54,6 @@ function(get_test_dependencies SDK result_var_name)
       sil-opt
       sil-passpipeline-dumper
       swift-frontend
-      swift-api-digester
       swift-demangle
       swift-demangle-yamldump
       swift-dependency-tool
@@ -134,6 +133,8 @@ set(LIT "${LLVM_MAIN_SRC_DIR}/utils/lit/lit.py")
 # the mtime on the failed tests, which makes them run first on the
 # consecutive execution, which makes local builds fail faster.
 set(SWIFT_LIT_ARGS "--incremental" CACHE STRING "Arguments to pass to lit")
+
+set(SWIFT_LIT_ENVIRONMENT "" CACHE STRING "Environment to use for lit invocations")
 
 if(NOT SWIFT_INCLUDE_TOOLS)
   list(APPEND SWIFT_LIT_ARGS
@@ -390,6 +391,7 @@ foreach(SDK ${SWIFT_SDKS})
               ${command_upload_swift_reflection_test}
               ${command_clean_test_results_dir}
               COMMAND
+                ${CMAKE_COMMAND} -E env ${SWIFT_LIT_ENVIRONMENT}
                 $<TARGET_FILE:Python3::Interpreter> "${LIT}"
                 ${LIT_ARGS}
                 "--param" "swift_test_subset=${test_subset}"
@@ -409,6 +411,7 @@ foreach(SDK ${SWIFT_SDKS})
               ${command_upload_swift_reflection_test}
               ${command_clean_test_results_dir}
               COMMAND
+                ${CMAKE_COMMAND} -E env ${SWIFT_LIT_ENVIRONMENT}
                 $<TARGET_FILE:Python3::Interpreter> "${LIT}"
                 ${LIT_ARGS}
                 "--param" "swift_test_subset=${test_subset}"

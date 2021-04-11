@@ -13,19 +13,19 @@ enum SomeError: Error {
   case boom
 }
 
-// CHECK-LABEL: sil hidden [ossa] @$s4test0A11AsyncLetIntSiyYF : $@convention(thin) @async () -> Int
+// CHECK-LABEL: sil hidden [ossa] @$s4test0A11AsyncLetIntSiyYaF : $@convention(thin) @async () -> Int
 func testAsyncLetInt() async -> Int {
   // CHECK: [[I:%.*]] = mark_uninitialized [var] %0
-  // CHECK: [[CLOSURE:%.*]] = function_ref @$s4test0A11AsyncLetIntSiyYFSiyYcfu_ : $@convention(thin) @async () -> Int
-  // CHECK: [[THICK_CLOSURE:%.*]] = thin_to_thick_function [[CLOSURE]] : $@convention(thin) @async () -> Int to $@async @callee_guaranteed () -> Int
-  // CHECK: [[REABSTRACT_THUNK:%.*]] = function_ref @$sSiIegHd_Sis5Error_pIegHrzo_TR : $@convention(thin) @async (@guaranteed @async @callee_guaranteed () -> Int) -> (@out Int, @error Error)
-  // CHECK: [[REABSTRACT_CLOSURE:%.*]] = partial_apply [callee_guaranteed] [[REABSTRACT_THUNK]]([[THICK_CLOSURE]]) : $@convention(thin) @async (@guaranteed @async @callee_guaranteed () -> Int) -> (@out Int, @error Error)
-  // CHECK: [[CLOSURE_ARG:%.*]] = convert_function [[REABSTRACT_CLOSURE]] : $@async @callee_guaranteed () -> (@out Int, @error Error) to $@async @callee_guaranteed @substituted <τ_0_0> () -> (@out τ_0_0, @error Error) for <Int>
-  // CHECK: [[RUN_CHILD_TASK:%.*]] = function_ref @$s12_Concurrency13_runChildTask9operationBoxyYKc_tYlF : $@convention(thin) @async <τ_0_0> (@guaranteed @async @callee_guaranteed @substituted <τ_0_0> () -> (@out τ_0_0, @error Error) for <τ_0_0>) -> @owned Builtin.NativeObject
-  // CHECK: [[CHILD_TASK:%.*]] = apply [[RUN_CHILD_TASK]]<Int>([[CLOSURE_ARG]]) : $@convention(thin) @async <τ_0_0> (@guaranteed @async @callee_guaranteed @substituted <τ_0_0> () -> (@out τ_0_0, @error Error) for <τ_0_0>) -> @owned Builtin.NativeObject
+  // CHECK: [[CLOSURE:%.*]] = function_ref @$s4test0A11AsyncLetIntSiyYaFSiyYaYbcfu_ : $@convention(thin) @Sendable @async () -> Int
+  // CHECK: [[THICK_CLOSURE:%.*]] = thin_to_thick_function [[CLOSURE]] : $@convention(thin) @Sendable @async () -> Int to $@Sendable @async @callee_guaranteed () -> Int
+  // CHECK: [[REABSTRACT_THUNK:%.*]] = function_ref @$sSiIeghHd_Sis5Error_pIeghHrzo_TR : $@convention(thin) @Sendable @async (@guaranteed @Sendable @async @callee_guaranteed () -> Int) -> (@out Int, @error Error)
+  // CHECK: [[REABSTRACT_CLOSURE:%.*]] = partial_apply [callee_guaranteed] [[REABSTRACT_THUNK]]([[THICK_CLOSURE]]) : $@convention(thin) @Sendable @async (@guaranteed @Sendable @async @callee_guaranteed () -> Int) -> (@out Int, @error Error)
+  // CHECK: [[CLOSURE_ARG:%.*]] = convert_function [[REABSTRACT_CLOSURE]] : $@Sendable @async @callee_guaranteed () -> (@out Int, @error Error) to $@Sendable @async @callee_guaranteed @substituted <τ_0_0> () -> (@out τ_0_0, @error Error) for <Int>
+  // CHECK: [[RUN_CHILD_TASK:%.*]] = function_ref @$ss13_runChildTask9operationBoxyYaYbKc_tYalF : $@convention(thin) @async <τ_0_0> (@guaranteed @Sendable @async @callee_guaranteed @substituted <τ_0_0> () -> (@out τ_0_0, @error Error) for <τ_0_0>) -> @owned Builtin.NativeObject
+  // CHECK: [[CHILD_TASK:%.*]] = apply [[RUN_CHILD_TASK]]<Int>([[CLOSURE_ARG]]) : $@convention(thin) @async <τ_0_0> (@guaranteed @Sendable @async @callee_guaranteed @substituted <τ_0_0> () -> (@out τ_0_0, @error Error) for <τ_0_0>) -> @owned Builtin.NativeObject
   async let i = await getInt()
 
-  // CHECK: [[FUTURE_GET:%.*]] = function_ref @$s12_Concurrency14_taskFutureGetyxBoYlF : $@convention(thin) @async <τ_0_0> (@guaranteed Builtin.NativeObject) -> @out τ_0_0
+  // CHECK: [[FUTURE_GET:%.*]] = function_ref @swift_task_future_wait : $@convention(thin) @async <τ_0_0> (@guaranteed Builtin.NativeObject) -> @out τ_0_0
   // CHECK: [[INT_RESULT:%.*]] = alloc_stack $Int
   // CHECK: apply [[FUTURE_GET]]<Int>([[INT_RESULT]], [[CHILD_TASK]]) : $@convention(thin) @async <τ_0_0> (@guaranteed Builtin.NativeObject) -> @out τ_0_0
   // CHECK: [[INT_RESULT_VALUE:%.*]] = load [trivial] [[INT_RESULT]] : $*Int
@@ -50,16 +50,16 @@ func testAsyncLetWithThrows(cond: Bool) async throws -> String {
   return await s
 }
 
-// CHECK-LABEL: sil hidden [ossa] @$s4test0A14AsyncLetThrowsSSyYKF : $@convention(thin) @async () -> (@owned String, @error Error) {
+// CHECK-LABEL: sil hidden [ossa] @$s4test0A14AsyncLetThrowsSSyYaKF : $@convention(thin) @async () -> (@owned String, @error Error) {
 func testAsyncLetThrows() async throws -> String {
   async let s = try await getStringThrowingly()
 
-  // CHECK: [[RUN_CHILD_TASK:%.*]] = function_ref @$s12_Concurrency22_taskFutureGetThrowingyxBoYKlF : $@convention(thin) @async <τ_0_0> (@guaranteed Builtin.NativeObject) -> (@out τ_0_0, @error Error)
+  // CHECK: [[RUN_CHILD_TASK:%.*]] = function_ref @swift_task_future_wait_throwing : $@convention(thin) @async <τ_0_0> (@guaranteed Builtin.NativeObject) -> (@out τ_0_0, @error Error)
   // CHECK: try_apply [[RUN_CHILD_TASK]]<String>
   return try await s
 }
 
-// CHECK-LABEL: sil hidden [ossa] @$s4test0A14DecomposeAwait4condSiSb_tYF : $@convention(thin) @async (Bool) -> Int {
+// CHECK-LABEL: sil hidden [ossa] @$s4test0A14DecomposeAwait4condSiSb_tYaF : $@convention(thin) @async (Bool) -> Int {
 func testDecomposeAwait(cond: Bool) async -> Int {
   // CHECK: [[I_VAR:%.*]] = alloc_stack $Int, let, name "i"
   // CHECK: [[I:%.*]] = mark_uninitialized [var] [[I_VAR]] : $*Int
@@ -68,7 +68,7 @@ func testDecomposeAwait(cond: Bool) async -> Int {
   async let (i, s) = await getIntAndString()
 
   if cond {
-    // CHECK: [[FUTURE_GET:%.*]] = function_ref @$s12_Concurrency14_taskFutureGetyxBoYlF : $@convention(thin) @async <τ_0_0> (@guaranteed Builtin.NativeObject) -> @out τ_0_0
+    // CHECK: [[FUTURE_GET:%.*]] = function_ref @swift_task_future_wait : $@convention(thin) @async <τ_0_0> (@guaranteed Builtin.NativeObject) -> @out τ_0_0
     // CHECK: [[TUPLE_RESULT:%.*]] = alloc_stack $(Int, String)
     // CHECK: apply [[FUTURE_GET]]<(Int, String)>([[TUPLE_RESULT]], {{%.*}}) : $@convention(thin) @async <τ_0_0> (@guaranteed Builtin.NativeObject) -> @out τ_0_0
     // CHECK: [[TUPLE_RESULT_VAL:%.*]] = load [take] [[TUPLE_RESULT]] : $*(Int, String)

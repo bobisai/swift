@@ -71,7 +71,7 @@ static bool isClangKeyword(Identifier name) {
 
   if (name.empty())
     return false;
-  return keywords.find(name.str()) != keywords.end();
+  return keywords.contains(name.str());
 }
 
 
@@ -1597,6 +1597,10 @@ private:
     os << " */";
   }
 
+  void visitErrorType(ErrorType *Ty, Optional<OptionalTypeKind> optionalKind) {
+    os << "/* error */id";
+  }
+
   bool isClangPointerType(const clang::TypeDecl *clangTypeDecl) const {
     ASTContext &ctx = getASTContext();
     auto &clangASTContext = ctx.getClangModuleLoader()->getClangASTContext();
@@ -1709,7 +1713,7 @@ private:
       auto *clangDecl = SD->getClangDecl();
       if (!clangDecl)
         return false;
-      return clangDecl->hasAttr<clang::SwiftNewtypeAttr>();
+      return clangDecl->hasAttr<clang::SwiftNewTypeAttr>();
     };
 
     // Use the type as bridged to Objective-C unless the element type is itself

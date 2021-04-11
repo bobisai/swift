@@ -1765,10 +1765,24 @@ private:
   }
   
   NodePointer demangleFunctionType(Node::Kind kind) {
-    bool throws = false, async = false;
+    bool throws = false, concurrent = false, async = false;
+    auto diffKind = MangledDifferentiabilityKind::NonDifferentiable;
     if (Mangled) {
       throws = Mangled.nextIf('z');
+      concurrent = Mangled.nextIf('y');
       async = Mangled.nextIf('Z');
+      if (Mangled.nextIf('D')) {
+        switch (auto kind = (MangledDifferentiabilityKind)Mangled.next()) {
+        case MangledDifferentiabilityKind::Forward:
+        case MangledDifferentiabilityKind::Reverse:
+        case MangledDifferentiabilityKind::Normal:
+        case MangledDifferentiabilityKind::Linear:
+          diffKind = kind;
+          break;
+        case MangledDifferentiabilityKind::NonDifferentiable:
+          assert(false && "Impossible case 'NonDifferentiable'");
+        }
+      }
     }
     NodePointer in_args = demangleType();
     if (!in_args)
@@ -1783,6 +1797,15 @@ private:
     }
     if (async) {
       block->addChild(Factory.createNode(Node::Kind::AsyncAnnotation), Factory);
+    }
+    if (concurrent) {
+      block->addChild(
+          Factory.createNode(Node::Kind::ConcurrentFunctionType), Factory);
+    }
+    if (diffKind != MangledDifferentiabilityKind::NonDifferentiable) {
+      block->addChild(
+          Factory.createNode(
+              Node::Kind::DifferentiableFunctionType, (char)diffKind), Factory);
     }
 
     NodePointer in_node = Factory.createNode(Node::Kind::ArgumentTuple);
@@ -2040,6 +2063,14 @@ private:
       inout->addChild(type, Factory);
       return inout;
     }
+    if (c == 'k') {
+      auto noDerivative = Factory.createNode(Node::Kind::NoDerivative);
+      auto type = demangleTypeImpl();
+      if (!type)
+        return nullptr;
+      noDerivative->addChild(type, Factory);
+      return noDerivative;
+    }
     if (c == 'S') {
       return demangleSubstitutionIndex();
     }
@@ -2147,6 +2178,9 @@ private:
       else
         return nullptr;
     }
+
+    if (Mangled.nextIf('h'))
+      addImplFunctionAttribute(type, "@Sendable");
 
     if (Mangled.nextIf('H'))
       addImplFunctionAttribute(type, "@async");

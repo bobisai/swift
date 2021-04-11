@@ -364,6 +364,7 @@ public:
   getFileSystem(const Optional<VFSOptions> &vfsOptions,
                 Optional<StringRef> primaryFile, std::string &error);
 
+  static SourceKit::UIdent getUIDForDeclLanguage(const swift::Decl *D);
   static SourceKit::UIdent getUIDForDecl(const swift::Decl *D,
                                          bool IsRef = false);
   static SourceKit::UIdent getUIDForExtensionOfDecl(const swift::Decl *D);
@@ -473,6 +474,8 @@ public:
   //==========================================================================//
 
   void globalConfigurationUpdated(std::shared_ptr<GlobalConfig> Config) override;
+
+  void dependencyUpdated() override;
 
   void indexSource(StringRef Filename, IndexingConsumer &Consumer,
                    ArrayRef<const char *> Args) override;

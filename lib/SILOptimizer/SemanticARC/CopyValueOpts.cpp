@@ -66,12 +66,11 @@ using namespace swift::semanticarc;
 // are within the borrow scope.
 //
 // TODO: This needs a better name.
-//
-// FIXME: CanonicalizeOSSALifetime replaces this once it supports borrows.
 bool SemanticARCOptVisitor::performGuaranteedCopyValueOptimization(
     CopyValueInst *cvi) {
-  // For now, do not run this optimization. This is just to be careful.
-  if (ctx.onlyGuaranteedOpts)
+  // All mandatory copy optimization is handled by CanonicalizeOSSALifetime,
+  // which knows how to preserve lifetimes for debugging.
+  if (ctx.onlyMandatoryOpts)
     return false;
 
   SmallVector<BorrowedValue, 4> borrowScopeIntroducers;
@@ -186,10 +185,9 @@ bool SemanticARCOptVisitor::performGuaranteedCopyValueOptimization(
     if (!foundNonDeadEnd && haveAnyLocalScopes)
       return false;
     SmallVector<Operand *, 8> scratchSpace;
-    SmallPtrSet<SILBasicBlock *, 4> visitedBlocks;
     if (llvm::any_of(borrowScopeIntroducers, [&](BorrowedValue borrowScope) {
           return !borrowScope.areUsesWithinScope(lr.getAllConsumingUses(),
-                                                 scratchSpace, visitedBlocks,
+                                                 scratchSpace,
                                                  getDeadEndBlocks());
         })) {
       return false;
@@ -206,12 +204,10 @@ bool SemanticARCOptVisitor::performGuaranteedCopyValueOptimization(
       OwnershipLiveRange::HasConsumingUse_t::YesButAllPhiArgs) {
     auto opPhi = *OwnershipPhiOperand::get(lr.getSingleUnknownConsumingUse());
     SmallVector<Operand *, 8> scratchSpace;
-    SmallPtrSet<SILBasicBlock *, 4> visitedBlocks;
 
     bool canOptimizePhi = opPhi.visitResults([&](SILValue value) {
       SWIFT_DEFER {
         scratchSpace.clear();
-        visitedBlocks.clear();
       };
 
       OwnershipLiveRange phiArgLR(value);
@@ -221,7 +217,7 @@ bool SemanticARCOptVisitor::performGuaranteedCopyValueOptimization(
 
       if (llvm::any_of(borrowScopeIntroducers, [&](BorrowedValue borrowScope) {
             return !borrowScope.areUsesWithinScope(
-                phiArgLR.getAllConsumingUses(), scratchSpace, visitedBlocks,
+                phiArgLR.getAllConsumingUses(), scratchSpace,
                 getDeadEndBlocks());
           })) {
         return false;
@@ -331,7 +327,7 @@ static bool canJoinIfCopyDiesInFunctionExitingBlock(
 }
 
 static Operand *lookThroughSingleForwardingUse(Operand *use) {
-  auto forwardingOperand = ForwardingOperand::get(use);
+  ForwardingOperand forwardingOperand(use);
   if (!forwardingOperand)
     return nullptr;
   auto forwardedValue = forwardingOperand.getSingleForwardedValue();
@@ -423,7 +419,7 @@ static bool tryJoinIfDestroyConsumingUseInSameBlock(
     // If not, see if this use did have a forwardedValue but that forwardedValue
     // has multiple end lifetime uses. In that case, we can optimize if there
     // aren't any uses/etc
-    auto forwardingOperand = ForwardingOperand::get(currentForwardingUse);
+    ForwardingOperand forwardingOperand(currentForwardingUse);
     if (!forwardingOperand)
       return false;
     auto forwardedValue = forwardingOperand.getSingleForwardedValue();
@@ -478,7 +474,7 @@ static bool tryJoinIfDestroyConsumingUseInSameBlock(
     // singleConsumingUse (the original forwarded use) and the destroy_value. In
     // such a case, we must bail!
     if (auto operand = BorrowingOperand::get(use))
-      if (!operand.visitLocalEndScopeUses([&](Operand *endScopeUse) {
+      if (!operand.visitScopeEndingUses([&](Operand *endScopeUse) {
             // Return false if we did see the relevant end scope instruction
             // in the block. That means that we are going to exit early and
             // return false.
@@ -724,11 +720,11 @@ bool SemanticARCOptVisitor::tryJoiningCopyValueLiveRangeWithOperand(
 
 /// Given an owned value that is completely enclosed within its parent owned
 /// value and is not consumed, eliminate the copy.
-///
-/// FIXME: CanonicalizeOSSALifetime replaces this.
 bool SemanticARCOptVisitor::tryPerformOwnedCopyValueOptimization(
     CopyValueInst *cvi) {
-  if (ctx.onlyGuaranteedOpts)
+  // All mandatory copy optimization is handled by CanonicalizeOSSALifetime,
+  // which knows how to preserve lifetimes for debugging.
+  if (ctx.onlyMandatoryOpts)
     return false;
 
   auto originalValue = cvi->getOperand();
@@ -769,8 +765,7 @@ bool SemanticARCOptVisitor::tryPerformOwnedCopyValueOptimization(
   // Ok, we have an owned value. If we do not have any non-destroying consuming
   // uses, see if all of our uses (ignoring destroying uses) are within our
   // parent owned value's lifetime.
-  SmallPtrSet<SILBasicBlock *, 8> visitedBlocks;
-  LinearLifetimeChecker checker(visitedBlocks, ctx.getDeadEndBlocks());
+  LinearLifetimeChecker checker(ctx.getDeadEndBlocks());
   if (!checker.validateLifetime(originalValue, parentLifetimeEndingUses,
                                 allCopyUses))
     return false;

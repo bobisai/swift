@@ -21,6 +21,7 @@
 #ifndef SWIFT_SILOPTIMIZER_PASSMANAGER_SILCOMBINER_H
 #define SWIFT_SILOPTIMIZER_PASSMANAGER_SILCOMBINER_H
 
+#include "swift/Basic/Defer.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILInstruction.h"
@@ -92,10 +93,6 @@ class SILCombiner :
   /// edges so it is safe to use this here.
   DeadEndBlocks deBlocks;
 
-  /// A utility struct used by OwnershipFixupContext to map sets of partially
-  /// post-dominating blocks to a full jointly post-dominating set.
-  JointPostDominanceSetComputer jPostDomComputer;
-
   /// External context struct used by \see ownershipRAUWHelper.
   OwnershipFixupContext ownershipFixupContext;
 
@@ -130,8 +127,8 @@ public:
               use->set(newValue);
               Worklist.add(use->getUser());
             }),
-        deBlocks(&B.getFunction()), jPostDomComputer(deBlocks),
-        ownershipFixupContext(instModCallbacks, deBlocks, jPostDomComputer) {}
+        deBlocks(&B.getFunction()),
+        ownershipFixupContext(instModCallbacks, deBlocks) {}
 
   bool runOnFunction(SILFunction &F);
 
@@ -304,6 +301,7 @@ public:
       
   SILInstruction *visitMarkDependenceInst(MarkDependenceInst *MDI);
   SILInstruction *visitClassifyBridgeObjectInst(ClassifyBridgeObjectInst *CBOI);
+  SILInstruction *visitGlobalValueInst(GlobalValueInst *globalValue);
   SILInstruction *visitConvertFunctionInst(ConvertFunctionInst *CFI);
   SILInstruction *
   visitConvertEscapeToNoEscapeInst(ConvertEscapeToNoEscapeInst *Cvt);
@@ -315,6 +313,8 @@ public:
   SILInstruction *optimizeBuiltinIsConcrete(BuiltinInst *I);
 
   SILInstruction *optimizeBuiltinCOWBufferForReading(BuiltinInst *BI);
+  SILInstruction *optimizeBuiltinCOWBufferForReadingNonOSSA(BuiltinInst *BI);
+  SILInstruction *optimizeBuiltinCOWBufferForReadingOSSA(BuiltinInst *BI);
 
   // Optimize the "trunc_N1_M2" builtin. if N1 is a result of "zext_M1_*" and
   // the following holds true: N1 > M1 and M2>= M1
@@ -433,6 +433,10 @@ private:
   /// Returns true if the results of a try_apply are not used.
   static bool isTryApplyResultNotUsed(UserListTy &AcceptedUses,
                                       TryApplyInst *TAI);
+
+  bool hasOwnership() const {
+    return Builder.hasOwnership();
+  }
 };
 
 } // end namespace swift

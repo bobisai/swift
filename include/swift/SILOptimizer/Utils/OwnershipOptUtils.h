@@ -19,6 +19,7 @@
 #ifndef SWIFT_SILOPTIMIZER_UTILS_OWNERSHIPOPTUTILS_H
 #define SWIFT_SILOPTIMIZER_UTILS_OWNERSHIPOPTUTILS_H
 
+#include "swift/Basic/Defer.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/OwnershipUtils.h"
 #include "swift/SIL/SILModule.h"
@@ -26,8 +27,28 @@
 
 namespace swift {
 
+/// Returns true if this value requires OSSA cleanups.
+inline bool requiresOSSACleanup(SILValue v) {
+  return v->getFunction()->hasOwnership()
+    && v.getOwnershipKind() != OwnershipKind::None
+    && v.getOwnershipKind() != OwnershipKind::Unowned;
+}
+
 // Defined in BasicBlockUtils.h
 struct JointPostDominanceSetComputer;
+
+/// Given a new phi that may use a guaranteed value, create nested borrow scopes
+/// for its incoming operands and end_borrows that cover the phi's extended
+/// borrow scope, which transitively includes any phis that use this phi.
+///
+/// Returns true if any changes were made.
+///
+/// Note: \p newPhi itself might not have Guaranteed ownership. A phi that
+/// converts Guaranteed to None ownership still needs nested borrows.
+///
+/// Note: This may be called on partially invalid OSSA form, where multiple
+/// newly created phis do not yet have a borrow scope.
+bool createBorrowScopeForPhiOperands(SILPhiArgument *newPhi);
 
 /// A struct that contains context shared in between different operation +
 /// "ownership fixup" utilities. Please do not put actual methods on this, it is
@@ -36,7 +57,9 @@ struct OwnershipFixupContext {
   Optional<InstModCallbacks> inlineCallbacks;
   InstModCallbacks &callbacks;
   DeadEndBlocks &deBlocks;
-  JointPostDominanceSetComputer &jointPostDomSetComputer;
+
+  SmallVector<Operand *, 8> transitiveBorrowedUses;
+  SmallVector<PhiOperand, 8> recursiveReborrows;
 
   /// Extra state initialized by OwnershipRAUWFixupHelper::get() that we use
   /// when RAUWing addresses. This ensures we do not need to recompute this
@@ -60,13 +83,12 @@ struct OwnershipFixupContext {
   };
   AddressFixupContext extraAddressFixupInfo;
 
-  OwnershipFixupContext(InstModCallbacks &callbacks, DeadEndBlocks &deBlocks,
-                        JointPostDominanceSetComputer &jointPostDomSetComputer)
-      : callbacks(callbacks), deBlocks(deBlocks),
-        jointPostDomSetComputer(jointPostDomSetComputer) {}
+  OwnershipFixupContext(InstModCallbacks &callbacks, DeadEndBlocks &deBlocks)
+      : callbacks(callbacks), deBlocks(deBlocks) {}
 
   void clear() {
-    jointPostDomSetComputer.clear();
+    transitiveBorrowedUses.clear();
+    recursiveReborrows.clear();
     extraAddressFixupInfo.allAddressUsesFromOldValue.clear();
     extraAddressFixupInfo.intPtrOp = InteriorPointerOperand();
   }
@@ -116,11 +138,43 @@ public:
   /// "forwarding" transformation must be performed upon \p newValue at \p
   /// oldValue's insertion point so that we can then here RAUW the transformed
   /// \p newValue.
-  SILBasicBlock::iterator perform();
+  SILBasicBlock::iterator
+  perform(SingleValueInstruction *maybeTransformedNewValue = nullptr);
 
 private:
   SILBasicBlock::iterator replaceAddressUses(SingleValueInstruction *oldValue,
                                              SILValue newValue);
+};
+
+/// A utility composed ontop of OwnershipFixupContext that knows how to replace
+/// a single use of a value with another value with a different ownership. We
+/// allow for the values to have different types.
+///
+/// NOTE: When not in OSSA, this just performs a normal set use, so this code is
+/// safe to use with all code.
+class OwnershipReplaceSingleUseHelper {
+  OwnershipFixupContext *ctx;
+  Operand *use;
+  SILValue newValue;
+
+public:
+  OwnershipReplaceSingleUseHelper()
+      : ctx(nullptr), use(nullptr), newValue(nullptr) {}
+
+  /// Return an instance of this class if we support replacing \p use->get()
+  /// with \p newValue.
+  ///
+  /// NOTE: For now we only support objects, not addresses so addresses will
+  /// always yield an invalid helper.
+  OwnershipReplaceSingleUseHelper(OwnershipFixupContext &ctx, Operand *use,
+                                  SILValue newValue);
+
+  /// Returns true if this helper was initialized into a valid state.
+  operator bool() const { return isValid(); }
+  bool isValid() const { return bool(ctx) && bool(use) && bool(newValue); }
+
+  /// Perform the actual RAUW.
+  SILBasicBlock::iterator perform();
 };
 
 } // namespace swift

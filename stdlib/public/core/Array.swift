@@ -1356,6 +1356,7 @@ extension Array: RangeReplaceableCollection {
   //===--- algorithms -----------------------------------------------------===//
 
   @inlinable
+  @available(*, deprecated, renamed: "withContiguousMutableStorageIfAvailable")
   public mutating func _withUnsafeMutableBufferPointerIfSupported<R>(
     _ body: (inout UnsafeMutableBufferPointer<Element>) throws -> R
   ) rethrows -> R? {
@@ -1984,3 +1985,5 @@ internal struct _ArrayAnyHashableBox<Element: Hashable>
     return true
   }
 }
+
+extension Array: Sendable, UnsafeSendable where Element: Sendable { }

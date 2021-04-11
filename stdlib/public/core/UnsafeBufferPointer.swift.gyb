@@ -446,6 +446,7 @@ extension Unsafe${Mutable}BufferPointer {
   }
 
   @inlinable
+  @available(*, deprecated, renamed: "withContiguousMutableStorageIfAvailable")
   public mutating func _withUnsafeMutableBufferPointerIfSupported<R>(
     _ body: (inout UnsafeMutableBufferPointer<Element>) throws -> R
   ) rethrows -> R? {
@@ -763,6 +764,10 @@ extension UnsafeMutableBufferPointer {
     return source._copyContents(initializing: self)
   }
 }
+
+extension UnsafeBufferPointer: Sendable { }
+extension UnsafeBufferPointer.Iterator: Sendable { }
+extension UnsafeMutableBufferPointer: Sendable { }
 
 // ${'Local Variables'}:
 // eval: (read-only-mode 1)

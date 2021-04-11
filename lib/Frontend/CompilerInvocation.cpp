@@ -101,6 +101,25 @@ getVersionedPrebuiltModulePath(Optional<llvm::VersionTuple> sdkVer,
   } while(true);
 }
 
+std::string CompilerInvocation::computePrebuiltCachePath(
+    StringRef RuntimeResourcePath, llvm::Triple target,
+    Optional<llvm::VersionTuple> sdkVer) {
+  SmallString<64> defaultPrebuiltPath{RuntimeResourcePath};
+  StringRef platform;
+  if (tripleIsMacCatalystEnvironment(target)) {
+    // The prebuilt cache for macCatalyst is the same as the one for macOS, not
+    // iOS or a separate location of its own.
+    platform = "macosx";
+  } else {
+    platform = getPlatformNameForTriple(target);
+  }
+  llvm::sys::path::append(defaultPrebuiltPath, platform, "prebuilt-modules");
+
+  // If the SDK version is given, we should check if SDK-versioned prebuilt
+  // module cache is available and use it if so.
+  return getVersionedPrebuiltModulePath(sdkVer, defaultPrebuiltPath);
+}
+
 void CompilerInvocation::setDefaultPrebuiltCacheIfNecessary() {
 
   if (!FrontendOpts.PrebuiltModuleCachePath.empty())
@@ -108,21 +127,8 @@ void CompilerInvocation::setDefaultPrebuiltCacheIfNecessary() {
   if (SearchPathOpts.RuntimeResourcePath.empty())
     return;
 
-  SmallString<64> defaultPrebuiltPath{SearchPathOpts.RuntimeResourcePath};
-  StringRef platform;
-  if (tripleIsMacCatalystEnvironment(LangOpts.Target)) {
-    // The prebuilt cache for macCatalyst is the same as the one for macOS, not iOS
-    // or a separate location of its own.
-    platform = "macosx";
-  } else {
-    platform = getPlatformNameForTriple(LangOpts.Target);
-  }
-  llvm::sys::path::append(defaultPrebuiltPath, platform, "prebuilt-modules");
-
-  // If the SDK version is given, we should check if SDK-versioned prebuilt
-  // module cache is available and use it if so.
-  FrontendOpts.PrebuiltModuleCachePath =
-    getVersionedPrebuiltModulePath(LangOpts.SDKVersion, defaultPrebuiltPath);
+  FrontendOpts.PrebuiltModuleCachePath = computePrebuiltCachePath(
+      SearchPathOpts.RuntimeResourcePath, LangOpts.Target, LangOpts.SDKVersion);
 }
 
 static void updateRuntimeLibraryPaths(SearchPathOptions &SearchPathOpts,
@@ -179,8 +185,10 @@ setIRGenOutputOptsFromFrontendOptions(IRGenOptions &IRGenOpts,
   // Set the OutputKind for the given Action.
   IRGenOpts.OutputKind = [](FrontendOptions::ActionType Action) {
     switch (Action) {
+    case FrontendOptions::ActionType::EmitIRGen:
+      return IRGenOutputKind::LLVMAssemblyBeforeOptimization;
     case FrontendOptions::ActionType::EmitIR:
-      return IRGenOutputKind::LLVMAssembly;
+      return IRGenOutputKind::LLVMAssemblyAfterOptimization;
     case FrontendOptions::ActionType::EmitBC:
       return IRGenOutputKind::LLVMBitcode;
     case FrontendOptions::ActionType::EmitAssembly:
@@ -385,6 +393,14 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
 
   Opts.EnableExperimentalConcurrency |=
     Args.hasArg(OPT_enable_experimental_concurrency);
+  Opts.EnableInferPublicSendable |=
+    Args.hasFlag(OPT_enable_infer_public_concurrent_value,
+                 OPT_disable_infer_public_concurrent_value,
+                 false);
+  Opts.EnableExperimentalAsyncHandler |=
+    Args.hasArg(OPT_enable_experimental_async_handler);
+  Opts.EnableExperimentalFlowSensitiveConcurrentCaptures |=
+    Args.hasArg(OPT_enable_experimental_flow_sensitive_concurrent_captures);
 
   Opts.DisableImplicitConcurrencyModuleImport |=
     Args.hasArg(OPT_disable_implicit_concurrency_module_import);
@@ -478,8 +494,6 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   // This can be enabled independently of the playground transform.
   Opts.PCMacro |= Args.hasArg(OPT_pc_macro);
 
-  Opts.InferImportAsMember |= Args.hasArg(OPT_enable_infer_import_as_member);
-
   Opts.EnableThrowWithoutTry |= Args.hasArg(OPT_enable_throw_without_try);
 
   if (auto A = Args.getLastArg(OPT_enable_objc_attr_requires_foundation_module,
@@ -488,15 +502,12 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
       = A->getOption().matches(OPT_enable_objc_attr_requires_foundation_module);
   }
 
-  Opts.EnableExperimentalPrespecialization |=
-      Args.hasArg(OPT_enable_experimental_prespecialization);
-
   if (auto A = Args.getLastArg(OPT_enable_testable_attr_requires_testable_module,
                                OPT_disable_testable_attr_requires_testable_module)) {
     Opts.EnableTestableAttrRequiresTestableModule
       = A->getOption().matches(OPT_enable_testable_attr_requires_testable_module);
   }
-  
+
   if (Args.getLastArg(OPT_debug_cycles))
     Opts.DebugDumpCycles = true;
 
@@ -521,7 +532,7 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
       Opts.MaxCircularityDepth = threshold;
     }
   }
-  
+
   for (const Arg *A : Args.filtered(OPT_D)) {
     Opts.addCustomConditionalCompilationFlag(A->getValue());
   }
@@ -531,6 +542,27 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   Opts.EnableSwift3ObjCInference =
     Args.hasFlag(OPT_enable_swift3_objc_inference,
                  OPT_disable_swift3_objc_inference, false);
+
+  if (const Arg *A = Args.getLastArg(OPT_library_level)) {
+    StringRef contents = A->getValue();
+    if (contents == "api") {
+      Opts.LibraryLevel = LibraryLevel::API;
+    } else if (contents == "spi") {
+      Opts.LibraryLevel = LibraryLevel::SPI;
+    } else {
+      Opts.LibraryLevel = LibraryLevel::Other;
+      if (contents != "other") {
+        // Error on unknown library levels.
+        auto inFlight = Diags.diagnose(SourceLoc(),
+                                       diag::error_unknown_library_level,
+                                       contents);
+
+        // Only warn for "ipi" as we may use it in the future.
+        if (contents == "ipi")
+          inFlight.limitBehavior(DiagnosticBehavior::Warning);
+      }
+    }
+  }
 
   if (Opts.EnableSwift3ObjCInference) {
     if (const Arg *A = Args.getLastArg(
@@ -542,6 +574,8 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
         Opts.WarnSwift3ObjCInference = Swift3ObjCInferenceWarnings::Complete;
     }
   }
+
+  Opts.WarnConcurrency |= Args.hasArg(OPT_warn_concurrency);
 
   Opts.WarnImplicitOverrides =
     Args.hasArg(OPT_warn_implicit_overrides);
@@ -661,6 +695,10 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
     }
   }
 
+  if (const Arg *A = Args.getLastArg(OPT_entry_point_function_name)) {
+    Opts.entryPointFunctionName = A->getValue();
+  }
+
   if (FrontendOpts.RequestedAction == FrontendOptions::ActionType::EmitSyntax) {
     Opts.BuildSyntaxTree = true;
     Opts.VerifySyntaxTree = true;
@@ -678,6 +716,12 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
     Opts.AttachCommentsToDecls = true;
   }
 
+  // If we are emitting a symbol graph file, configure lexing and parsing to
+  // remember comments.
+  if (FrontendOpts.EmitSymbolGraph) {
+    Opts.AttachCommentsToDecls = true;
+  }
+
   // If we're parsing SIL, access control doesn't make sense to enforce.
   if (Args.hasArg(OPT_parse_sil) ||
       FrontendOpts.InputsAndOutputs.shouldTreatAsSIL()) {
@@ -687,6 +731,21 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
 
   if (FrontendOpts.AllowModuleWithCompilerErrors) {
     Opts.AllowModuleWithCompilerErrors = true;
+  }
+
+  if (auto A =
+          Args.getLastArg(OPT_enable_ast_verifier, OPT_disable_ast_verifier)) {
+    using ASTVerifierOverrideKind = LangOptions::ASTVerifierOverrideKind;
+    if (A->getOption().matches(OPT_enable_ast_verifier)) {
+      Opts.ASTVerifierOverride = ASTVerifierOverrideKind::EnableVerifier;
+    } else if (A->getOption().matches(OPT_disable_ast_verifier)) {
+      Opts.ASTVerifierOverride = ASTVerifierOverrideKind::DisableVerifier;
+    } else {
+      // This is an assert since getLastArg should not have let us get here if
+      // we did not have one of enable/disable specified.
+      llvm_unreachable(
+          "Should have found one of enable/disable ast verifier?!");
+    }
   }
 
   return HadError || UnsupportedOS || UnsupportedArch;
@@ -770,6 +829,9 @@ static bool ParseTypeCheckerArgs(TypeCheckerOptions &Opts, ArgList &Args,
   Opts.EnableOneWayClosureParameters |=
       Args.hasArg(OPT_experimental_one_way_closure_params);
 
+  Opts.PrintFullConvention |=
+      Args.hasArg(OPT_experimental_print_full_convention);
+
   Opts.DebugConstraintSolver |= Args.hasArg(OPT_debug_constraints);
   Opts.DebugGenericSignatures |= Args.hasArg(OPT_debug_generic_signatures);
 
@@ -833,7 +895,6 @@ static bool ParseClangImporterArgs(ClangImporterOptions &Opts,
                           {"-working-directory", workingDirectory.str()});
   }
 
-  Opts.InferImportAsMember |= Args.hasArg(OPT_enable_infer_import_as_member);
   Opts.DumpClangDiagnostics |= Args.hasArg(OPT_dump_clang_diagnostics);
 
   if (Args.hasArg(OPT_embed_bitcode))
@@ -925,12 +986,12 @@ static bool ParseSearchPathArgs(SearchPathOptions &Opts,
   // Opts.RuntimeIncludePath is set by calls to
   // setRuntimeIncludePath() or setMainExecutablePath().
   // Opts.RuntimeImportPath is set by calls to
-  // setRuntimeIncludePath() or setMainExecutablePath() and 
+  // setRuntimeIncludePath() or setMainExecutablePath() and
   // updated by calls to setTargetTriple() or parseArgs().
-  // Assumes exactly one of setMainExecutablePath() or setRuntimeIncludePath() 
+  // Assumes exactly one of setMainExecutablePath() or setRuntimeIncludePath()
   // is called before setTargetTriple() and parseArgs().
   // TODO: improve the handling of RuntimeIncludePath.
-  
+
   return false;
 }
 
@@ -946,6 +1007,9 @@ static bool ParseDiagnosticArgs(DiagnosticOptions &Opts, ArgList &Args,
   Opts.SkipDiagnosticPasses |= Args.hasArg(OPT_disable_diagnostic_passes);
   Opts.ShowDiagnosticsAfterFatalError |=
     Args.hasArg(OPT_show_diagnostics_after_fatal);
+
+  for (Arg *A : Args.filtered(OPT_verify_additional_file))
+    Opts.AdditionalVerifierFiles.push_back(A->getValue());
 
   Opts.UseColor |=
       Args.hasFlag(OPT_color_diagnostics,
@@ -1056,7 +1120,7 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
                          ClangImporterOptions &ClangOpts) {
   using namespace options;
 
-  
+
   if (const Arg *A = Args.getLastArg(OPT_sil_inline_threshold)) {
     if (StringRef(A->getValue()).getAsInteger(10, Opts.InlineThreshold)) {
       Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
@@ -1152,7 +1216,10 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
   // -Ounchecked might also set removal of runtime asserts (cond_fail).
   Opts.RemoveRuntimeAsserts |= Args.hasArg(OPT_RemoveRuntimeAsserts);
 
+  Opts.EnableCopyPropagation |= Args.hasArg(OPT_enable_copy_propagation);
+  Opts.DisableCopyPropagation |= Args.hasArg(OPT_disable_copy_propagation);
   Opts.EnableARCOptimizations &= !Args.hasArg(OPT_disable_arc_opts);
+  Opts.EnableOSSAModules |= Args.hasArg(OPT_enable_ossa_modules);
   Opts.EnableOSSAOptimizations &= !Args.hasArg(OPT_disable_ossa_opts);
   Opts.EnableSpeculativeDevirtualization |= Args.hasArg(OPT_enable_spec_devirt);
   Opts.DisableSILPerfOptimizations |= Args.hasArg(OPT_disable_sil_perf_optzns);
@@ -1591,7 +1658,7 @@ static bool ParseIRGenArgs(IRGenOptions &Opts, ArgList &Args,
     Opts.DisableLegacyTypeInfo = true;
   }
 
-  if (Args.hasArg(OPT_prespecialize_generic_metadata) && 
+  if (Args.hasArg(OPT_prespecialize_generic_metadata) &&
       !Args.hasArg(OPT_disable_generic_metadata_prespecialization)) {
     Opts.PrespecializeGenericMetadata = true;
   }

@@ -76,9 +76,9 @@ DECL_NODES = [
     Node('FunctionSignature', kind='Syntax',
          children=[
              Child('Input', kind='ParameterClause'),
-             Child('AsyncKeyword', kind='IdentifierToken',
+             Child('AsyncOrReasyncKeyword', kind='IdentifierToken',
                    classification='Keyword',
-                   text_choices=['async'], is_optional=True),
+                   text_choices=['async', 'reasync'], is_optional=True),
              Child('ThrowsOrRethrowsKeyword', kind='Token',
                    is_optional=True,
                    token_choices=[
@@ -197,7 +197,7 @@ DECL_NODES = [
          ]),
 
     # class-declaration -> attributes? access-level-modifier?
-    #                      'class' class-name
+    #                      ('class' | 'actor') class-name
     #                      generic-parameter-clause?
     #                      type-inheritance-clause?
     #                      generic-where-clause?
@@ -210,7 +210,8 @@ DECL_NODES = [
                    collection_element_name='Attribute', is_optional=True),
              Child('Modifiers', kind='ModifierList',
                    collection_element_name='Modifier', is_optional=True),
-             Child('ClassKeyword', kind='ClassToken'),
+             Child('ClassOrActorKeyword', kind='Token',
+                    token_choices=['ClassToken', 'ContextualKeywordToken']),
              Child('Identifier', kind='IdentifierToken'),
              Child('GenericParameterClause', kind='GenericParameterClause',
                    is_optional=True),

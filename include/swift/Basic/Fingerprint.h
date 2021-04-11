@@ -95,6 +95,11 @@ public:
   }
 
 public:
+  bool operator<(const Fingerprint &other) const {
+    return core < other.core;
+  }
+
+public:
   /// The fingerprint value consisting of 32 bytes of zeroes.
   ///
   /// This fingerprint is a perfectly fine value for a hash, but it is
@@ -123,9 +128,9 @@ template <> struct StableHasher::Combiner<Fingerprint> {
     // raw bytes from the core by hand.
     uint8_t buffer[8];
     memcpy(buffer, &Val.core.first, sizeof(buffer));
-    hasher.combine(buffer);
+    hasher.combine<sizeof(buffer)>(buffer);
     memcpy(buffer, &Val.core.second, sizeof(buffer));
-    hasher.combine(buffer);
+    hasher.combine<sizeof(buffer)>(buffer);
   }
 };
 

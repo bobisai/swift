@@ -24,7 +24,7 @@ using namespace semanticarc;
 bool SemanticARCOptVisitor::visitUncheckedOwnershipConversionInst(
     UncheckedOwnershipConversionInst *uoci) {
   // Return false if we are supposed to only be running guaranteed opts.
-  if (ctx.onlyGuaranteedOpts)
+  if (ctx.onlyMandatoryOpts)
     return false;
 
   // Then check if we are running tests and shouldn't perform this optimization
@@ -56,8 +56,7 @@ bool SemanticARCOptVisitor::visitUncheckedOwnershipConversionInst(
 
   // Ok, now we need to perform our lifetime check.
   SmallVector<Operand *, 8> consumingUses(op->getConsumingUses());
-  SmallPtrSet<SILBasicBlock *, 8> visitedBlocks;
-  LinearLifetimeChecker checker(visitedBlocks, ctx.getDeadEndBlocks());
+  LinearLifetimeChecker checker(ctx.getDeadEndBlocks());
   if (!checker.validateLifetime(op, consumingUses, newUses))
     return false;
 

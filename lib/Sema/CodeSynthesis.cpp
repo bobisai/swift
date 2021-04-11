@@ -147,6 +147,11 @@ static void maybeAddMemberwiseDefaultArg(ParamDecl *arg, VarDecl *var,
   if (var->isLet())
     return;
 
+  // If there's no parent pattern there's not enough structure to even perform
+  // this analysis. Just bail.
+  if (!var->getParentPattern())
+    return;
+
   // We can only provide default values for patterns binding a single variable.
   // i.e. var (a, b) = getSomeTuple() is not allowed.
   if (!var->getParentPattern()->getSingleVar())
@@ -260,8 +265,8 @@ static ConstructorDecl *createImplicitConstructor(NominalTypeDecl *decl,
         if (var->isPropertyMemberwiseInitializedWithWrappedType()) {
           varInterfaceType = var->getPropertyWrapperInitValueInterfaceType();
 
-          auto wrapperInfo = var->getPropertyWrapperBackingPropertyInfo();
-          isAutoClosure = wrapperInfo.wrappedValuePlaceholder->isAutoClosure();
+          auto initInfo = var->getPropertyWrapperInitializerInfo();
+          isAutoClosure = initInfo.getWrappedValuePlaceholder()->isAutoClosure();
         } else {
           varInterfaceType = backingPropertyType;
         }
@@ -424,51 +429,53 @@ configureGenericDesignatedInitOverride(ASTContext &ctx,
       moduleDecl, superclassDecl);
 
   GenericSignature genericSig;
-
-  // Inheriting initializers that have their own generic parameters
   auto *genericParams = superclassCtor->getGenericParams();
-  if (genericParams) {
+
+  auto superclassCtorSig = superclassCtor->getGenericSignature();
+  auto superclassSig = superclassDecl->getGenericSignature();
+
+  if (superclassCtorSig.getPointer() != superclassSig.getPointer()) {
     SmallVector<GenericTypeParamDecl *, 4> newParams;
+    SmallVector<GenericTypeParamType *, 1> newParamTypes;
 
-    // First, clone the superclass constructor's generic parameter list,
-    // but change the depth of the generic parameters to be one greater
-    // than the depth of the subclass.
-    unsigned depth = 0;
-    if (auto genericSig = classDecl->getGenericSignature())
-      depth = genericSig->getGenericParams().back()->getDepth() + 1;
+    // Inheriting initializers that have their own generic parameters
+    if (genericParams) {
+      // First, clone the superclass constructor's generic parameter list,
+      // but change the depth of the generic parameters to be one greater
+      // than the depth of the subclass.
+      unsigned depth = 0;
+      if (auto genericSig = classDecl->getGenericSignature())
+        depth = genericSig->getGenericParams().back()->getDepth() + 1;
 
-    for (auto *param : genericParams->getParams()) {
-      auto *newParam = new (ctx) GenericTypeParamDecl(classDecl,
-                                                      param->getName(),
-                                                      SourceLoc(),
-                                                      depth,
-                                                      param->getIndex());
-      newParams.push_back(newParam);
+      for (auto *param : genericParams->getParams()) {
+        auto *newParam = new (ctx) GenericTypeParamDecl(classDecl,
+                                                        param->getName(),
+                                                        SourceLoc(),
+                                                        depth,
+                                                        param->getIndex());
+        newParams.push_back(newParam);
+      }
+
+      // We don't have to clone the requirements, because they're not
+      // used for anything.
+      genericParams = GenericParamList::create(ctx,
+                                               SourceLoc(),
+                                               newParams,
+                                               SourceLoc(),
+                                               ArrayRef<RequirementRepr>(),
+                                               SourceLoc());
+
+      // Add the generic parameter types.
+      for (auto *newParam : newParams) {
+        newParamTypes.push_back(
+            newParam->getDeclaredInterfaceType()->castTo<GenericTypeParamType>());
+      }
     }
-
-    // We don't have to clone the requirements, because they're not
-    // used for anything.
-    genericParams = GenericParamList::create(ctx,
-                                             SourceLoc(),
-                                             newParams,
-                                             SourceLoc(),
-                                             ArrayRef<RequirementRepr>(),
-                                             SourceLoc());
 
     // Build a generic signature for the derived class initializer.
-
-    // Add the generic parameters.
-    SmallVector<GenericTypeParamType *, 1> newParamTypes;
-    for (auto *newParam : newParams) {
-      newParamTypes.push_back(
-          newParam->getDeclaredInterfaceType()->castTo<GenericTypeParamType>());
-    }
-
-    auto superclassSig = superclassCtor->getGenericSignature();
-
     unsigned superclassDepth = 0;
-    if (auto genericSig = superclassDecl->getGenericSignature())
-      superclassDepth = genericSig->getGenericParams().back()->getDepth() + 1;
+    if (superclassSig)
+      superclassDepth = superclassSig->getGenericParams().back()->getDepth() + 1;
 
     // We're going to be substituting the requirements of the base class
     // initializer to form the requirements of the derived class initializer.
@@ -490,13 +497,13 @@ configureGenericDesignatedInitOverride(ASTContext &ctx,
     };
 
     SmallVector<Requirement, 2> requirements;
-    for (auto reqt : superclassSig->getRequirements())
+    for (auto reqt : superclassCtorSig->getRequirements())
       if (auto substReqt = reqt.subst(substFn, lookupConformanceFn))
         requirements.push_back(*substReqt);
 
     // Now form the substitution map that will be used to remap parameter
     // types.
-    subMap = SubstitutionMap::get(superclassSig,
+    subMap = SubstitutionMap::get(superclassCtorSig,
                                   substFn, lookupConformanceFn);
 
     genericSig = evaluateOrDefault(
@@ -550,20 +557,24 @@ configureInheritedDesignatedInitAttributes(ClassDecl *classDecl,
     ctor->getAttrs().add(clonedAttr);
   }
 
+  // Inherit the rethrows attribute.
+  if (superclassCtor->getAttrs().hasAttribute<RethrowsAttr>()) {
+    auto *clonedAttr = new (ctx) RethrowsAttr(/*implicit=*/true);
+    ctor->getAttrs().add(clonedAttr);
+  }
+
   // If the superclass has its own availability, make sure the synthesized
   // constructor is only as available as its superclass's constructor.
   if (superclassCtor->getAttrs().hasAttribute<AvailableAttr>()) {
-    SmallVector<Decl *, 2> asAvailableAs;
+    SmallVector<const Decl *, 2> asAvailableAs;
 
     // We don't have to look at enclosing contexts of the superclass constructor,
     // because designated initializers must always be defined in the superclass
     // body, and we already enforce that a superclass is at least as available as
     // a subclass.
     asAvailableAs.push_back(superclassCtor);
-    Decl *parentDecl = classDecl;
-    while (parentDecl != nullptr) {
+    if (auto *parentDecl = classDecl->getInnermostDeclWithAvailability()) {
       asAvailableAs.push_back(parentDecl);
-      parentDecl = parentDecl->getDeclContext()->getAsDecl();
     }
     AvailabilityInference::applyInferredAvailableAttrs(
         ctor, asAvailableAs, ctx);

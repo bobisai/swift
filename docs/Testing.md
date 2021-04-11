@@ -124,7 +124,9 @@ out with ``lit.py -h``. We document some of the more useful ones below:
          line, amid a sequence.
 * ``-a`` causes a test's commandline and output to always be printed.
 * ``--filter=<pattern>`` causes only tests with paths matching the given regular
-  expression to be run.
+  expression to be run. Alternately, you can use the `LIT_FILTER='<pattern>'`
+  environment variable, in case you're invoking `lit.py` through some other
+  tool such as `build-script`.
 * ``-i`` causes tests that have a newer modification date and failing tests to
   be run first. This is implemented by updating the mtimes of the tests.
 * ``--no-execute`` causes a dry run to be performed. *NOTE* This means that all
@@ -199,16 +201,16 @@ For every target above, there are variants for different optimizations:
 * the target with ``-optimize`` suffix (e.g., ``check-swift-optimize``) -- runs
   execution tests in ``-O`` mode.  This target will only run tests marked as
   ``executable_test``.
-* the target with ``-optimize-unchecked`` suffix (e.g.,
-  ``check-swift-optimize-unchecked``) -- runs execution tests in
+* the target with ``-optimize_unchecked`` suffix (e.g.,
+  ``check-swift-optimize_unchecked``) -- runs execution tests in
   ``-Ounchecked`` mode. This target will only run tests marked as
   ``executable_test``.
-* the target with ``-executable`` suffix (e.g.,
-  ``check-swift-executable-iphoneos-arm64``) -- runs tests marked with
+* the target with ``-only_executable`` suffix (e.g.,
+  ``check-swift-only_executable-iphoneos-arm64``) -- runs tests marked with
   ``executable_test`` in ``-Onone`` mode.
-* the target with ``-non-executable`` suffix (e.g.,
-  ``check-swift-non-executable-iphoneos-arm64``) -- runs tests not marked with
-  ``executable_test`` in ``-Onone`` mode.
+* the target with ``-only_non_executable`` suffix (e.g.,
+  ``check-swift-only_non_executable-iphoneos-arm64``) -- runs tests not marked
+  with ``executable_test`` in ``-Onone`` mode.
 
 ### Writing tests
 

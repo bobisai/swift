@@ -103,10 +103,6 @@ static llvm::cl::opt<bool>
 EnableExperimentalConcurrency("enable-experimental-concurrency",
                    llvm::cl::desc("Enable experimental concurrency model."));
 
-static llvm::cl::opt<bool> EnableExperimentalPrespecialization(
-    "enable-experimental-prespecialization",
-    llvm::cl::desc("Enable experimental prespecialziation."));
-
 static llvm::cl::opt<bool>
 VerifyExclusivity("enable-verify-exclusivity",
                   llvm::cl::desc("Verify the access markers used to enforce exclusivity."));
@@ -115,12 +111,18 @@ static llvm::cl::opt<bool>
 EnableSpeculativeDevirtualization("enable-spec-devirt",
                   llvm::cl::desc("Enable Speculative Devirtualization pass."));
 
+static llvm::cl::opt<bool> EnableOSSAModules(
+    "enable-ossa-modules",
+    llvm::cl::desc("Do we always serialize SIL in OSSA form? If "
+                   "this is disabled we do not serialize in OSSA "
+                   "form when optimizing."));
+
 namespace {
-enum EnforceExclusivityMode {
+enum class EnforceExclusivityMode {
   Unchecked, // static only
   Checked,   // static and dynamic
   DynamicOnly,
-  None
+  None,
 };
 } // end anonymous namespace
 
@@ -202,6 +204,16 @@ SILVerifyNone("sil-verify-none",
               llvm::cl::Hidden,
               llvm::cl::init(false),
               llvm::cl::desc("Completely disable SIL verification"));
+
+/// Customize the default behavior
+static llvm::cl::opt<bool> EnableASTVerifier(
+    "enable-ast-verifier", llvm::cl::Hidden, llvm::cl::init(false),
+    llvm::cl::desc("Override the default behavior and Enable the ASTVerifier"));
+
+static llvm::cl::opt<bool> DisableASTVerifier(
+    "disable-ast-verifier", llvm::cl::Hidden, llvm::cl::init(false),
+    llvm::cl::desc(
+        "Override the default behavior and force disable the ASTVerifier"));
 
 static llvm::cl::opt<bool>
 RemoveRuntimeAsserts("remove-runtime-asserts",
@@ -310,6 +322,22 @@ static void runCommandLineSelectedPasses(SILModule *Module,
     Module->verify();
 }
 
+namespace {
+using ASTVerifierOverrideKind = LangOptions::ASTVerifierOverrideKind;
+} // end anonymous namespace
+
+static Optional<ASTVerifierOverrideKind> getASTOverrideKind() {
+  assert(!(EnableASTVerifier && DisableASTVerifier) &&
+         "Can only set one of EnableASTVerifier/DisableASTVerifier?!");
+  if (EnableASTVerifier)
+    return ASTVerifierOverrideKind::EnableVerifier;
+
+  if (DisableASTVerifier)
+    return ASTVerifierOverrideKind::DisableVerifier;
+
+  return None;
+}
+
 // This function isn't referenced outside its translation unit, but it
 // can't use the "static" keyword because its address is used for
 // getMainExecutable (since some platforms don't support taking the
@@ -362,12 +390,11 @@ int main(int argc, char **argv) {
   Invocation.getLangOptions().DisableAvailabilityChecking = true;
   Invocation.getLangOptions().EnableAccessControl = false;
   Invocation.getLangOptions().EnableObjCAttrRequiresFoundation = false;
-  
+  if (auto overrideKind = getASTOverrideKind()) {
+    Invocation.getLangOptions().ASTVerifierOverride = *overrideKind;
+  }
   Invocation.getLangOptions().EnableExperimentalConcurrency =
     EnableExperimentalConcurrency;
-
-  Invocation.getLangOptions().EnableExperimentalPrespecialization =
-      EnableExperimentalPrespecialization;
 
   Invocation.getLangOptions().EnableObjCInterop =
     EnableObjCInterop ? true :
@@ -435,6 +462,7 @@ int main(int argc, char **argv) {
 
   SILOpts.EnableSpeculativeDevirtualization = EnableSpeculativeDevirtualization;
   SILOpts.IgnoreAlwaysInline = IgnoreAlwaysInline;
+  SILOpts.EnableOSSAModules = EnableOSSAModules;
 
   serialization::ExtendedValidationInfo extendedInfo;
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =

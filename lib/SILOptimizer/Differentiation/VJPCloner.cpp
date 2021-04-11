@@ -218,6 +218,7 @@ public:
   }
 
   void visitReturnInst(ReturnInst *ri) {
+    Builder.setCurrentDebugScope(getOpScope(ri->getDebugScope()));
     auto loc = ri->getOperand().getLoc();
     // Build pullback struct value for original block.
     auto *origExit = ri->getParent();
@@ -291,6 +292,7 @@ public:
   }
 
   void visitBranchInst(BranchInst *bi) {
+    Builder.setCurrentDebugScope(getOpScope(bi->getDebugScope()));
     // Build pullback struct value for original block.
     // Build predecessor enum value for destination block.
     auto *origBB = bi->getParent();
@@ -310,6 +312,7 @@ public:
   }
 
   void visitCondBranchInst(CondBranchInst *cbi) {
+    Builder.setCurrentDebugScope(getOpScope(cbi->getDebugScope()));
     // Build pullback struct value for original block.
     auto *pbStructVal = buildPullbackValueStructValue(cbi);
     // Create a new `cond_br` instruction.
@@ -320,6 +323,7 @@ public:
   }
 
   void visitSwitchEnumTermInst(SwitchEnumTermInst inst) {
+    Builder.setCurrentDebugScope(getOpScope(inst->getDebugScope()));
     // Build pullback struct value for original block.
     auto *pbStructVal = buildPullbackValueStructValue(*inst);
 
@@ -360,6 +364,7 @@ public:
   }
 
   void visitCheckedCastBranchInst(CheckedCastBranchInst *ccbi) {
+    Builder.setCurrentDebugScope(getOpScope(ccbi->getDebugScope()));
     // Build pullback struct value for original block.
     auto *pbStructVal = buildPullbackValueStructValue(ccbi);
     // Create a new `checked_cast_branch` instruction.
@@ -373,6 +378,7 @@ public:
   }
 
   void visitCheckedCastValueBranchInst(CheckedCastValueBranchInst *ccvbi) {
+    Builder.setCurrentDebugScope(getOpScope(ccvbi->getDebugScope()));
     // Build pullback struct value for original block.
     auto *pbStructVal = buildPullbackValueStructValue(ccvbi);
     // Create a new `checked_cast_value_branch` instruction.
@@ -386,6 +392,7 @@ public:
   }
 
   void visitCheckedCastAddrBranchInst(CheckedCastAddrBranchInst *ccabi) {
+    Builder.setCurrentDebugScope(getOpScope(ccabi->getDebugScope()));
     // Build pullback struct value for original block.
     auto *pbStructVal = buildPullbackValueStructValue(ccabi);
     // Create a new `checked_cast_addr_branch` instruction.
@@ -437,6 +444,7 @@ public:
       return;
     }
 
+    Builder.setCurrentDebugScope(getOpScope(ai->getDebugScope()));
     auto loc = ai->getLoc();
     auto &builder = getBuilder();
     auto origCallee = getOpValue(ai->getCallee());
@@ -638,7 +646,7 @@ public:
     // Apply the VJP.
     // The VJP should be specialized, so no substitution map is necessary.
     auto *vjpCall = getBuilder().createApply(loc, vjpValue, SubstitutionMap(),
-                                             vjpArgs, ai->isNonThrowing());
+                                             vjpArgs, ai->getApplyOptions());
     LLVM_DEBUG(getADDebugStream() << "Applied vjp function\n" << *vjpCall);
     builder.emitDestroyValueOperation(loc, vjpValue);
 
@@ -698,6 +706,7 @@ public:
   }
 
   void visitTryApplyInst(TryApplyInst *tai) {
+    Builder.setCurrentDebugScope(getOpScope(tai->getDebugScope()));
     // Build pullback struct value for original block.
     auto *pbStructVal = buildPullbackValueStructValue(tai);
     // Create a new `try_apply` instruction.
@@ -706,7 +715,8 @@ public:
         tai->getLoc(), getOpValue(tai->getCallee()),
         getOpSubstitutionMap(tai->getSubstitutionMap()), args,
         createTrampolineBasicBlock(tai, pbStructVal, tai->getNormalBB()),
-        createTrampolineBasicBlock(tai, pbStructVal, tai->getErrorBB()));
+        createTrampolineBasicBlock(tai, pbStructVal, tai->getErrorBB()),
+        tai->getApplyOptions());
   }
 
   void visitDifferentiableFunctionInst(DifferentiableFunctionInst *dfi) {
@@ -970,7 +980,7 @@ SILFunction *VJPCloner::Implementation::createEmptyPullback() {
 
   Mangle::DifferentiationMangler mangler;
   auto pbName = mangler.mangleLinearMap(
-      original, AutoDiffLinearMapKind::Pullback, config);
+      original->getName(), AutoDiffLinearMapKind::Pullback, config);
   // Set pullback generic signature equal to VJP generic signature.
   // Do not use witness generic signature, which may have same-type requirements
   // binding all generic parameters to concrete types.
@@ -1008,6 +1018,7 @@ SILBasicBlock *VJPCloner::Implementation::createTrampolineBasicBlock(
   // In the trampoline block, build predecessor enum value for VJP successor
   // block and branch to it.
   SILBuilder trampolineBuilder(trampolineBB);
+  trampolineBuilder.setCurrentDebugScope(getOpScope(termInst->getDebugScope()));
   auto *origBB = termInst->getParent();
   auto *succEnumVal =
       buildPredecessorEnumValue(trampolineBuilder, origBB, succBB, pbStructVal);
@@ -1032,7 +1043,6 @@ VJPCloner::Implementation::buildPullbackValueStructValue(TermInst *termInst) {
     auto *predEnumArg = vjpBB->getArguments().back();
     bbPullbackValues.insert(bbPullbackValues.begin(), predEnumArg);
   }
-  getBuilder().setCurrentDebugScope(getOpScope(termInst->getDebugScope()));
   return getBuilder().createStruct(loc, structLoweredTy, bbPullbackValues);
 }
 

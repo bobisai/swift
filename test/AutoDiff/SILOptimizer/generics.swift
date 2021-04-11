@@ -6,7 +6,7 @@ import _Differentiation
 func identity<T : Differentiable>(_ x: T) -> T {
   return x
 }
-_ = gradient(at: Float(1), in: { x in identity(x) })
+_ = gradient(at: Float(1), of: { x in identity(x) })
 
 // Test PullbackCloner local buffer allocation.
 // Verify that local buffers are immediately set to zero.
@@ -21,17 +21,17 @@ _ = gradient(at: Float(1), in: { x in identity(x) })
 // Test TF-201: differentiate direct references to generic function.
 // This involves reabstraction thunk differentiation.
 
-_ = gradient(at: Float(1), in: identity)
+_ = gradient(at: Float(1), of: identity)
 
 protocol DifferentiableAdditiveArithmetic: Differentiable & AdditiveArithmetic {
-  @differentiable
+  @differentiable(reverse)
   static func + (lhs: Self, rhs: Self) -> Self
 }
 extension Float: DifferentiableAdditiveArithmetic {}
 func generic<T: DifferentiableAdditiveArithmetic>(_ x: T) -> T {
   x + x + x
 }
-_ = gradient(at: Float(10), in: generic)
+_ = gradient(at: Float(10), of: generic)
 
 struct Wrapper<Scalar : Differentiable> : Differentiable {
   var value: Scalar
@@ -40,28 +40,28 @@ struct Wrapper<Scalar : Differentiable> : Differentiable {
 func generic<T>(_ x: Wrapper<T>) -> T {
   return x.value
 }
-_ = gradient(at: Wrapper<Float>(1), in: generic)
+_ = gradient(at: Wrapper<Float>(1), of: generic)
 
 func generic2<T: Differentiable, U: Differentiable>(_ x: T, _ y: Float, _ z: U) -> T {
   return x
 }
 func foo<T>(_ x: Wrapper<T>) {
-  _ = gradient(at: Float(1), 2, x, in: generic2)
+  _ = gradient(at: Float(1), 2, x, of: generic2)
 }
 
 // Test case where associated derivative function's requirements are met.
 extension Wrapper where Scalar : Numeric {
-  @differentiable(wrt: self where Scalar : Differentiable & FloatingPoint)
+  @differentiable(reverse, wrt: self where Scalar : Differentiable & FloatingPoint)
   func mean() -> Wrapper {
     return self
   }
 
-  @differentiable(wrt: self where Scalar : Differentiable & FloatingPoint)
+  @differentiable(reverse, wrt: self where Scalar : Differentiable & FloatingPoint)
   func variance() -> Wrapper {
     return mean() // ok
   }
 }
-_ = pullback(at: Wrapper<Float>(1), in: { $0.variance() })
+_ = pullback(at: Wrapper<Float>(1), of: { $0.variance() })
 
 // Tests TF-277.
 protocol Layer : Differentiable {
@@ -69,7 +69,7 @@ protocol Layer : Differentiable {
 }
 struct SupervisedTrainer<Model : Layer> {
   var model: Model
-  var lossFunction: @differentiable (Model.Output, Model.Output) -> Float
+  var lossFunction: @differentiable(reverse) (Model.Output, Model.Output) -> Float
   func fit(y: Model.Output) {
     _ = gradient(at: y) { y in return self.lossFunction(y, y) }
   }
@@ -82,17 +82,17 @@ struct TF_440_Input<Input: Differentiable, State: Differentiable>
   var state: State
 }
 struct TF_440<T : Differentiable> {
-  @differentiable
+  @differentiable(reverse)
   func applied(to input: TF_440_Input<Float, Float>) -> Float {
     return input.state
   }
 
-  @differentiable
+  @differentiable(reverse)
   func applied(to input: TF_440_Input<T, Float>) -> Float {
     return input.state
   }
 
-  @differentiable
+  @differentiable(reverse)
   func applied(to input: TF_440_Input<T, Float>) -> T {
     return input.input
   }
@@ -103,7 +103,7 @@ protocol TF_508_Proto {
   associatedtype Scalar
 }
 extension TF_508_Proto where Scalar : FloatingPoint {
-  @differentiable(
+  @differentiable(reverse
     where Self : Differentiable, Scalar : Differentiable,
           // Conformance requirement with dependent member type.
           Self.TangentVector : TF_508_Proto
@@ -112,7 +112,7 @@ extension TF_508_Proto where Scalar : FloatingPoint {
     return lhs
   }
 
-  @differentiable(
+  @differentiable(reverse
     where Self : Differentiable, Scalar : Differentiable,
           // Same-type requirement with dependent member type.
           Self.TangentVector == Float
@@ -149,11 +149,11 @@ extension TF_508_Struct : Differentiable where Scalar : Differentiable {
 func TF_508() {
   let x = TF_508_Struct<Float>()
   // Test conformance requirement with dependent member type.
-  _ = pullback(at: x, in: { (x: TF_508_Struct<Float>) -> TF_508_Struct<Float> in
+  _ = pullback(at: x, of: { (x: TF_508_Struct<Float>) -> TF_508_Struct<Float> in
     return x + x
   })
   // Test same-type requirement with dependent member type.
-  _ = pullback(at: x, in: { (x: TF_508_Struct<Float>) -> TF_508_Struct<Float> in
+  _ = pullback(at: x, of: { (x: TF_508_Struct<Float>) -> TF_508_Struct<Float> in
     return x - x
   })
 }
@@ -164,7 +164,7 @@ struct TF_523_Struct : Differentiable & AdditiveArithmetic {
   typealias TangentVector = TF_523_Struct
 }
 
-@differentiable
+@differentiable(reverse)
 func TF_523_f(_ x: TF_523_Struct) -> Float {
   return x.a * 2
 }
@@ -174,7 +174,7 @@ protocol TF_534_Layer : Differentiable {
   associatedtype Input : Differentiable
   associatedtype Output : Differentiable
 
-  @differentiable
+  @differentiable(reverse)
   func callAsFunction(_ input: Input) -> Output
 }
 struct TF_534_Tensor<Scalar> : Differentiable {}
@@ -192,7 +192,7 @@ struct TF_546<T: FloatingPoint>: AdditiveArithmetic {
   var real: T
   var imaginary: T
 
-  @differentiable(where T: Differentiable, T == T.TangentVector)
+  @differentiable(reverse where T: Differentiable, T == T.TangentVector)
   init(real: T = 0, imaginary: T = 0) {
     self.real = real
     self.imaginary = imaginary
@@ -207,7 +207,7 @@ extension TF_546 where T: Differentiable, T == T.TangentVector {
     return (TF_546(real: real, imaginary: imaginary), { ($0.real, $0.imaginary) })
   }
 }
-let _: @differentiable(Float, Float) -> TF_546<Float> = { r, i in
+let _: @differentiable(reverse) (Float, Float) -> TF_546<Float> = { r, i in
   TF_546(real: r, imaginary: i)
 }
 
@@ -217,7 +217,7 @@ let _: @differentiable(Float, Float) -> TF_546<Float> = { r, i in
 struct TF_652<Scalar> {}
 extension TF_652 : Differentiable where Scalar : FloatingPoint {}
 
-@differentiable(wrt: x where Scalar: FloatingPoint)
+@differentiable(reverse, wrt: x where Scalar: FloatingPoint)
 func test<Scalar: Numeric>(x: TF_652<Scalar>) -> TF_652<Scalar> {
   for _ in 0..<10 {
     let _ = x
@@ -230,7 +230,7 @@ protocol TF_682_Proto {
   associatedtype Scalar
 }
 extension TF_682_Proto where Scalar : FloatingPoint {
-  @differentiable(
+  @differentiable(reverse
     where Self : Differentiable, Scalar : Differentiable,
           // Same-type requirement with dependent member type.
           Self.TangentVector == Float
@@ -257,15 +257,15 @@ public struct TF_688_Struct<Scalar> {
   var x: Scalar
 }
 extension TF_688_Struct: Differentiable where Scalar: Differentiable {
-  @differentiable
+  @differentiable(reverse)
   public static func id(x: Self) -> Self {
     return x
   }
 }
-@differentiable(wrt: x)
+@differentiable(reverse, wrt: x)
 public func TF_688<Scalar: Differentiable>(
   _ x: TF_688_Struct<Scalar>,
-  reduction: @differentiable (TF_688_Struct<Scalar>) -> TF_688_Struct<Scalar> = TF_688_Struct.id
+  reduction: @differentiable(reverse) (TF_688_Struct<Scalar>) -> TF_688_Struct<Scalar> = TF_688_Struct.id
 ) -> TF_688_Struct<Scalar> {
   reduction(x)
 }
@@ -276,11 +276,11 @@ protocol TF_697_Module: Differentiable {
     associatedtype Input
     associatedtype Output: Differentiable
 
-    @differentiable(wrt: self)
+    @differentiable(reverse, wrt: self)
     func callModule(_ input: Input) -> Output
 }
 protocol TF_697_Layer: TF_697_Module where Input: Differentiable {
-    @differentiable
+    @differentiable(reverse)
     func callLayer(_ input: Input) -> Output
 }
 struct TF_697_Sequential<Layer1: TF_697_Module, Layer2: TF_697_Layer>: TF_697_Module
@@ -288,13 +288,13 @@ struct TF_697_Sequential<Layer1: TF_697_Module, Layer2: TF_697_Layer>: TF_697_Mo
     var layer1: Layer1
     var layer2: Layer2
 
-    @differentiable(wrt: self)
+    @differentiable(reverse, wrt: self)
     func callModule(_ input: Layer1.Input) -> Layer2.Output {
         layer2.callLayer(layer1.callModule(input))
     }
 }
 extension TF_697_Sequential: TF_697_Layer where Layer1: TF_697_Layer {
-    @differentiable
+    @differentiable(reverse)
     func callLayer(_ input: Layer1.Input) -> Layer2.Output {
         layer2.callLayer(layer1.callLayer(input))
     }
@@ -313,18 +313,18 @@ extension TF_817: Differentiable where T: Differentiable {
   }
 }
 extension TF_817 {
-  @differentiable(wrt: self where T: Differentiable)
+  @differentiable(reverse, wrt: self where T: Differentiable)
   public func test(index: Int) -> T {
     return self.foo(0) // crash happened here
   }
 }
 
 // TF-886: Test `partial_apply` of linear map subset parameters thunk.
-@differentiable
+@differentiable(reverse)
 func TF_886_foo<T, U: Differentiable>(_: Float, _: T, _: U) -> Float {
   return 0
 }
-@differentiable
+@differentiable(reverse)
 func TF_886_bar<T>(x: Float, y: T) -> Float {
   return TF_886_foo(x, y, 0)
 }
@@ -338,8 +338,8 @@ struct ContextualLayoutRequirement<T: Differentiable, U: AnyObject> {
 }
 extension ContextualLayoutRequirement {
   func test(_ x: T) {
-    let _: @differentiable (T) -> T = { _ in self.stored }
-    let _: @differentiable (T) -> T = { $0 }
+    let _: @differentiable(reverse) (T) -> T = { _ in self.stored }
+    let _: @differentiable(reverse) (T) -> T = { $0 }
   }
 }
 // The layout requirement directly involves `T`, the differentiable function
@@ -352,8 +352,8 @@ struct LayoutRequirement<T: AnyObject & Differentiable> {
 }
 extension LayoutRequirement {
   func test(_ x: T) {
-    let _: @differentiable (T) -> T = { _ in self.stored }
-    let _: @differentiable (T) -> T = { $0 }
+    let _: @differentiable(reverse) (T) -> T = { _ in self.stored }
+    let _: @differentiable(reverse) (T) -> T = { $0 }
   }
 }
 */
@@ -369,8 +369,8 @@ struct ContextualSuperclassRequirement<T: Differentiable, U: Super> {
 }
 extension ContextualSuperclassRequirement {
   func test(_ x: T) {
-    let _: @differentiable (T) -> T = { _ in self.stored }
-    let _: @differentiable (T) -> T = { $0 }
+    let _: @differentiable(reverse) (T) -> T = { _ in self.stored }
+    let _: @differentiable(reverse) (T) -> T = { $0 }
   }
 }
 // The superclass requirement directly involves `T`, the differentiable
@@ -383,8 +383,8 @@ struct SuperclassRequirement<T: Super & Differentiable> {
 }
 extension SuperclassRequirement {
   func test(_ x: T) {
-    let _: @differentiable (T) -> T = { _ in self.stored }
-    let _: @differentiable (T) -> T = { $0 }
+    let _: @differentiable(reverse) (T) -> T = { _ in self.stored }
+    let _: @differentiable(reverse) (T) -> T = { $0 }
   }
 }
 */

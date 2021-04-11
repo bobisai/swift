@@ -26,6 +26,7 @@
 #define DEBUG_TYPE "sil-ownership-model-eliminator"
 
 #include "swift/Basic/BlotSetVector.h"
+#include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/Projection.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILFunction.h"
@@ -178,7 +179,8 @@ struct OwnershipModelEliminatorVisitor
 
 #define HANDLE_FORWARDING_INST(Cls)                                            \
   bool visit##Cls##Inst(Cls##Inst *i) {                                        \
-    OwnershipForwardingMixin::get(i)->setOwnershipKind(OwnershipKind::None);   \
+    OwnershipForwardingMixin::get(i)->setForwardingOwnershipKind(              \
+        OwnershipKind::None);                                                  \
     return true;                                                               \
   }
   HANDLE_FORWARDING_INST(ConvertFunction)
@@ -254,7 +256,10 @@ bool OwnershipModelEliminatorVisitor::visitStoreBorrowInst(
                               StoreOwnershipQualifier::Unqualified);
   });
 
-  // Then remove the qualified store.
+  // Then remove the qualified store after RAUWing si with its dest. This
+  // ensures that any uses of the interior pointer result of the store_borrow
+  // are rewritten to be on the dest point.
+  si->replaceAllUsesWith(si->getDest());
   eraseInstruction(si);
   return true;
 }
@@ -320,9 +325,53 @@ bool OwnershipModelEliminatorVisitor::visitUnmanagedAutoreleaseValueInst(
   return true;
 }
 
+// Poison every debug variable associated with \p value.
+static void injectDebugPoison(DestroyValueInst *destroy) {
+  // TODO: SILDebugVariable should define it's key. Until then, we try to be
+  // consistent with IRGen.
+  using StackSlotKey =
+      std::pair<unsigned, std::pair<const SILDebugScope *, StringRef>>;
+  // This DenseSet points to StringRef memory into the debug_value insts.
+  llvm::SmallDenseSet<StackSlotKey> poisonedVars;
+
+  SILValue destroyedValue = destroy->getOperand();
+  for (Operand *use : getDebugUses(destroyedValue)) {
+    auto debugVal = dyn_cast<DebugValueInst>(use->getUser());
+    if (!debugVal || debugVal->poisonRefs())
+      continue;
+
+    const SILDebugScope *scope = debugVal->getDebugScope();
+    auto loc = debugVal->getLoc();
+
+    Optional<SILDebugVariable> varInfo = debugVal->getVarInfo();
+    if (!varInfo)
+      continue;
+
+    unsigned argNo = varInfo->ArgNo;
+    if (!poisonedVars.insert({argNo, {scope, varInfo->Name}}).second)
+      continue;
+
+    SILBuilder builder(destroy);
+    // The poison DebugValue's DebugLocation must be identical to the original
+    // DebugValue. The DebugScope is used to identify the variable's unique
+    // shadow copy. The SILLocation is used to determine the VarDecl, which is
+    // necessary in some cases to derive a unique variable name.
+    //
+    // This debug location is obviously inconsistent with surrounding code, but
+    // IRGen is responsible for fixing this.
+    builder.setCurrentDebugScope(scope);
+    auto *newDebugVal = builder.createDebugValue(loc, destroyedValue, *varInfo,
+                                                 /*poisonRefs*/ true);
+    assert(*(newDebugVal->getVarInfo()) == *varInfo && "lost in translation");
+    (void)newDebugVal;
+  }
+}
+
 bool OwnershipModelEliminatorVisitor::visitDestroyValueInst(
     DestroyValueInst *dvi) {
   // A destroy_value of an address-only type cannot be replaced.
+  //
+  // TODO: When LowerAddresses runs before this, we can remove this case.
   if (dvi->getOperand()->getType().isAddressOnly(*dvi->getFunction()))
     return false;
 
@@ -331,13 +380,16 @@ bool OwnershipModelEliminatorVisitor::visitDestroyValueInst(
   withBuilder<void>(dvi, [&](SILBuilder &b, SILLocation loc) {
     b.emitDestroyValueOperation(loc, dvi->getOperand());
   });
+  if (dvi->poisonRefs()) {
+    injectDebugPoison(dvi);
+  }
   eraseInstruction(dvi);
   return true;
 }
 
 bool OwnershipModelEliminatorVisitor::visitCheckedCastBranchInst(
     CheckedCastBranchInst *cbi) {
-  cbi->setOwnershipKind(OwnershipKind::None);
+  cbi->setForwardingOwnershipKind(OwnershipKind::None);
 
   // In ownership qualified SIL, checked_cast_br must pass its argument to the
   // fail case so we can clean it up. In non-ownership qualified SIL, we expect
@@ -357,7 +409,7 @@ bool OwnershipModelEliminatorVisitor::visitCheckedCastBranchInst(
 
 bool OwnershipModelEliminatorVisitor::visitSwitchEnumInst(
     SwitchEnumInst *swei) {
-  swei->setOwnershipKind(OwnershipKind::None);
+  swei->setForwardingOwnershipKind(OwnershipKind::None);
 
   // In ownership qualified SIL, switch_enum must pass its argument to the fail
   // case so we can clean it up. In non-ownership qualified SIL, we expect no

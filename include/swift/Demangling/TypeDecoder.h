@@ -19,14 +19,19 @@
 #define SWIFT_DEMANGLING_TYPEDECODER_H
 
 #include "TypeLookupError.h"
-#include "swift/ABI/MetadataValues.h"
 #include "swift/Basic/LLVM.h"
+#include "swift/ABI/MetadataValues.h"
+#include "swift/AST/LayoutConstraintKind.h"
+#include "swift/AST/RequirementBase.h"
+#include "swift/Basic/Unreachable.h"
 #include "swift/Demangling/Demangler.h"
 #include "swift/Demangling/NamespaceMacros.h"
 #include "swift/Runtime/Portability.h"
-#include "swift/Basic/Unreachable.h"
 #include "swift/Strings.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/PointerIntPair.h"
+#include "llvm/ADT/StringSwitch.h"
 #include <vector>
 
 namespace swift {
@@ -67,6 +72,7 @@ public:
   void setValueOwnership(ValueOwnership ownership) {
     Flags = Flags.withValueOwnership(ownership);
   }
+  void setNoDerivative() { Flags = Flags.withNoDerivative(true); }
   void setFlags(ParameterFlags flags) { Flags = flags; };
 
   FunctionParam withLabel(StringRef label) const {
@@ -232,60 +238,71 @@ enum class ImplFunctionRepresentation {
 
 enum class ImplFunctionDifferentiabilityKind {
   NonDifferentiable,
+  Forward,
+  Reverse,
   Normal,
-  Linear
+  Linear,
 };
 
 class ImplFunctionTypeFlags {
   unsigned Rep : 3;
   unsigned Pseudogeneric : 1;
   unsigned Escaping : 1;
+  unsigned Concurrent : 1;
   unsigned Async : 1;
-  unsigned DifferentiabilityKind : 2;
+  unsigned DifferentiabilityKind : 3;
 
 public:
   ImplFunctionTypeFlags()
-      : Rep(0), Pseudogeneric(0), Escaping(0), Async(0),
+      : Rep(0), Pseudogeneric(0), Escaping(0), Concurrent(0), Async(0),
         DifferentiabilityKind(0) {}
 
   ImplFunctionTypeFlags(ImplFunctionRepresentation rep, bool pseudogeneric,
-                        bool noescape, bool async,
+                        bool noescape, bool concurrent, bool async,
                         ImplFunctionDifferentiabilityKind diffKind)
       : Rep(unsigned(rep)), Pseudogeneric(pseudogeneric), Escaping(noescape),
-        Async(async), DifferentiabilityKind(unsigned(diffKind)) {}
+        Concurrent(concurrent), Async(async),
+        DifferentiabilityKind(unsigned(diffKind)) {}
 
   ImplFunctionTypeFlags
   withRepresentation(ImplFunctionRepresentation rep) const {
     return ImplFunctionTypeFlags(
-        rep, Pseudogeneric, Escaping, Async,
+        rep, Pseudogeneric, Escaping, Concurrent, Async,
         ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
+  }
+
+  ImplFunctionTypeFlags
+  withConcurrent() const {
+    return ImplFunctionTypeFlags(
+        ImplFunctionRepresentation(Rep), Pseudogeneric, Escaping, true,
+        Async, ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
   }
 
   ImplFunctionTypeFlags
   withAsync() const {
     return ImplFunctionTypeFlags(
-        ImplFunctionRepresentation(Rep), Pseudogeneric, Escaping, true,
-        ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
+        ImplFunctionRepresentation(Rep), Pseudogeneric, Escaping, Concurrent,
+        true, ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
   }
 
   ImplFunctionTypeFlags
   withEscaping() const {
     return ImplFunctionTypeFlags(
-        ImplFunctionRepresentation(Rep), Pseudogeneric, true, Async,
+        ImplFunctionRepresentation(Rep), Pseudogeneric, true, Concurrent, Async,
         ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
   }
   
   ImplFunctionTypeFlags
   withPseudogeneric() const {
     return ImplFunctionTypeFlags(
-        ImplFunctionRepresentation(Rep), true, Escaping, Async,
+        ImplFunctionRepresentation(Rep), true, Escaping, Concurrent, Async,
         ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
   }
 
   ImplFunctionTypeFlags
   withDifferentiabilityKind(ImplFunctionDifferentiabilityKind diffKind) const {
     return ImplFunctionTypeFlags(ImplFunctionRepresentation(Rep), Pseudogeneric,
-                                 Escaping, Async, diffKind);
+                                 Escaping, Concurrent, Async, diffKind);
   }
 
   ImplFunctionRepresentation getRepresentation() const {
@@ -296,7 +313,14 @@ public:
 
   bool isEscaping() const { return Escaping; }
 
+  bool isSendable() const { return Concurrent; }
+
   bool isPseudogeneric() const { return Pseudogeneric; }
+
+  bool isDifferentiable() const {
+    return getDifferentiabilityKind() !=
+        ImplFunctionDifferentiabilityKind::NonDifferentiable;
+  }
 
   ImplFunctionDifferentiabilityKind getDifferentiabilityKind() const {
     return ImplFunctionDifferentiabilityKind(DifferentiabilityKind);
@@ -330,6 +354,91 @@ getObjCClassOrProtocolName(NodePointer node) {
 }
 #endif
 
+template <typename BuiltType, typename BuiltRequirement,
+          typename BuiltLayoutConstraint, typename BuilderType>
+void decodeRequirement(NodePointer node,
+                       llvm::SmallVectorImpl<BuiltRequirement> &requirements,
+                       BuilderType &Builder) {
+  for (auto &child : *node) {
+    if (child->getKind() == Demangle::Node::Kind::DependentGenericParamCount)
+      continue;
+
+    if (child->getNumChildren() != 2)
+      return;
+    auto subjectType = Builder.decodeMangledType(child->getChild(0));
+    if (!subjectType)
+      return;
+
+    BuiltType constraintType;
+    if (child->getKind() ==
+            Demangle::Node::Kind::DependentGenericConformanceRequirement ||
+        child->getKind() ==
+            Demangle::Node::Kind::DependentGenericSameTypeRequirement) {
+      constraintType = Builder.decodeMangledType(child->getChild(1));
+      if (!constraintType)
+        return;
+    }
+
+    switch (child->getKind()) {
+    case Demangle::Node::Kind::DependentGenericConformanceRequirement: {
+      requirements.push_back(BuiltRequirement(
+          Builder.isExistential(constraintType) ? RequirementKind::Conformance
+                                                : RequirementKind::Superclass,
+          subjectType, constraintType));
+      break;
+    }
+    case Demangle::Node::Kind::DependentGenericSameTypeRequirement: {
+      requirements.push_back(BuiltRequirement(RequirementKind::SameType,
+                                              subjectType, constraintType));
+      break;
+    }
+    case Demangle::Node::Kind::DependentGenericLayoutRequirement: {
+      auto kindChild = child->getChild(1);
+      if (kindChild->getKind() != Demangle::Node::Kind::Identifier)
+        return;
+
+      auto kind =
+          llvm::StringSwitch<llvm::Optional<LayoutConstraintKind>>(
+              kindChild->getText())
+              .Case("U", LayoutConstraintKind::UnknownLayout)
+              .Case("R", LayoutConstraintKind::RefCountedObject)
+              .Case("N", LayoutConstraintKind::NativeRefCountedObject)
+              .Case("C", LayoutConstraintKind::Class)
+              .Case("D", LayoutConstraintKind::NativeClass)
+              .Case("T", LayoutConstraintKind::Trivial)
+              .Cases("E", "e", LayoutConstraintKind::TrivialOfExactSize)
+              .Cases("M", "m", LayoutConstraintKind::TrivialOfAtMostSize)
+              .Default(None);
+
+      if (!kind)
+        return;
+
+      BuiltLayoutConstraint layout;
+
+      if (kind != LayoutConstraintKind::TrivialOfExactSize &&
+          kind != LayoutConstraintKind::TrivialOfAtMostSize) {
+        layout = Builder.getLayoutConstraint(*kind);
+      } else {
+        auto size = child->getChild(2)->getIndex();
+        auto alignment = 0;
+
+        if (child->getNumChildren() == 4)
+          alignment = child->getChild(3)->getIndex();
+
+        layout =
+            Builder.getLayoutConstraintWithSizeAlign(*kind, size, alignment);
+      }
+
+      requirements.push_back(
+          BuiltRequirement(RequirementKind::Layout, subjectType, layout));
+      break;
+    }
+    default:
+      break;
+    }
+  }
+}
+
 #define MAKE_NODE_TYPE_ERROR(Node, Fmt, ...)                                   \
   TYPE_LOOKUP_ERROR_FMT("TypeDecoder.h:%u: Node kind %u \"%.*s\" - " Fmt,      \
                         __LINE__, (unsigned)Node->getKind(),                   \
@@ -346,6 +455,10 @@ class TypeDecoder {
   using BuiltType = typename BuilderType::BuiltType;
   using BuiltTypeDecl = typename BuilderType::BuiltTypeDecl;
   using BuiltProtocolDecl = typename BuilderType::BuiltProtocolDecl;
+  using Field = typename BuilderType::BuiltSILBoxField;
+  using BuiltSubstitution = typename BuilderType::BuiltSubstitution;
+  using BuiltRequirement = typename BuilderType::BuiltRequirement;
+  using BuiltLayoutConstraint = typename BuilderType::BuiltLayoutConstraint;
   using NodeKind = Demangle::Node::Kind;
 
   BuilderType &Builder;
@@ -601,10 +714,6 @@ public:
     case NodeKind::NoEscapeFunctionType:
     case NodeKind::AutoClosureType:
     case NodeKind::EscapingAutoClosureType:
-    case NodeKind::DifferentiableFunctionType:
-    case NodeKind::EscapingDifferentiableFunctionType:
-    case NodeKind::LinearFunctionType:
-    case NodeKind::EscapingLinearFunctionType:
     case NodeKind::FunctionType: {
       if (Node->getNumChildren() < 2)
         return MAKE_NODE_TYPE_ERROR(Node,
@@ -620,21 +729,37 @@ public:
           flags.withConvention(FunctionMetadataConvention::CFunctionPointer);
       } else if (Node->getKind() == NodeKind::ThinFunctionType) {
         flags = flags.withConvention(FunctionMetadataConvention::Thin);
-      } else if (Node->getKind() == NodeKind::DifferentiableFunctionType ||
-               Node->getKind() ==
-                   NodeKind::EscapingDifferentiableFunctionType) {
-        flags = flags.withDifferentiabilityKind(
-            FunctionMetadataDifferentiabilityKind::Normal);
-      } else if (Node->getKind() == NodeKind::LinearFunctionType ||
-                 Node->getKind() == NodeKind::EscapingLinearFunctionType) {
-        flags = flags.withDifferentiabilityKind(
-            FunctionMetadataDifferentiabilityKind::Linear);
       }
 
       unsigned firstChildIdx = 0;
       if (Node->getChild(firstChildIdx)->getKind() == NodeKind::ClangType) {
         // [TODO: synthesize-Clang-type-from-mangled-name] Use the first child
         // to create a ClangTypeInfo.
+        ++firstChildIdx;
+      }
+
+      FunctionMetadataDifferentiabilityKind diffKind;
+      if (Node->getChild(firstChildIdx)->getKind() ==
+            NodeKind::DifferentiableFunctionType) {
+        auto mangledDiffKind = (MangledDifferentiabilityKind)
+            Node->getChild(firstChildIdx)->getIndex();
+        switch (mangledDiffKind) {
+        case MangledDifferentiabilityKind::NonDifferentiable:
+          assert(false && "Unexpected case NonDifferentiable");
+          break;
+        case MangledDifferentiabilityKind::Forward:
+          diffKind = FunctionMetadataDifferentiabilityKind::Forward;
+          break;
+        case MangledDifferentiabilityKind::Reverse:
+          diffKind = FunctionMetadataDifferentiabilityKind::Reverse;
+          break;
+        case MangledDifferentiabilityKind::Normal:
+          diffKind = FunctionMetadataDifferentiabilityKind::Normal;
+          break;
+        case MangledDifferentiabilityKind::Linear:
+          diffKind = FunctionMetadataDifferentiabilityKind::Linear;
+          break;
+        }
         ++firstChildIdx;
       }
 
@@ -645,6 +770,13 @@ public:
         ++firstChildIdx;
       }
 
+      bool isSendable = false;
+      if (Node->getChild(firstChildIdx)->getKind()
+            == NodeKind::ConcurrentFunctionType) {
+        isSendable = true;
+        ++firstChildIdx;
+      }
+
       bool isAsync = false;
       if (Node->getChild(firstChildIdx)->getKind()
             == NodeKind::AsyncAnnotation) {
@@ -652,7 +784,9 @@ public:
         ++firstChildIdx;
       }
 
-      flags = flags.withAsync(isAsync).withThrows(isThrow);
+      flags = flags.withConcurrent(isSendable)
+          .withAsync(isAsync).withThrows(isThrow)
+          .withDifferentiable(diffKind.isDifferentiable());
 
       if (Node->getNumChildren() < firstChildIdx + 2)
         return MAKE_NODE_TYPE_ERROR(Node,
@@ -671,16 +805,13 @@ public:
               .withEscaping(
                           Node->getKind() == NodeKind::FunctionType ||
                           Node->getKind() == NodeKind::EscapingAutoClosureType ||
-                          Node->getKind() == NodeKind::EscapingObjCBlock ||
-                          Node->getKind() ==
-                              NodeKind::EscapingDifferentiableFunctionType ||
-                          Node->getKind() ==
-                              NodeKind::EscapingLinearFunctionType);
+                          Node->getKind() == NodeKind::EscapingObjCBlock);
 
       auto result = decodeMangledType(Node->getChild(firstChildIdx+1));
       if (result.isError())
         return result;
-      return Builder.createFunctionType(parameters, result.getType(), flags);
+      return Builder.createFunctionType(
+          parameters, result.getType(), flags, diffKind);
     }
     case NodeKind::ImplFunctionType: {
       auto calleeConvention = ImplParameterConvention::Direct_Unowned;
@@ -723,15 +854,25 @@ public:
         } else if (child->getKind() == NodeKind::ImplFunctionAttribute) {
           if (!child->hasText())
             return MAKE_NODE_TYPE_ERROR0(child, "expected text");
-          if (child->getText() == "@async") {
+          if (child->getText() == "@Sendable") {
+            flags = flags.withConcurrent();
+          } else if (child->getText() == "@async") {
             flags = flags.withAsync();
           }
-        } else if (child->getKind() == NodeKind::ImplDifferentiable) {
-          flags = flags.withDifferentiabilityKind(
-              ImplFunctionDifferentiabilityKind::Normal);
-        } else if (child->getKind() == NodeKind::ImplLinear) {
-          flags = flags.withDifferentiabilityKind(
-              ImplFunctionDifferentiabilityKind::Linear);
+        } else if (child->getKind() == NodeKind::ImplDifferentiabilityKind) {
+          ImplFunctionDifferentiabilityKind implDiffKind;
+          switch ((MangledDifferentiabilityKind)child->getIndex()) {
+          #define SIMPLE_CASE(CASE) \
+              case MangledDifferentiabilityKind::CASE: \
+                implDiffKind = ImplFunctionDifferentiabilityKind::CASE; break;
+          SIMPLE_CASE(NonDifferentiable)
+          SIMPLE_CASE(Normal)
+          SIMPLE_CASE(Linear)
+          SIMPLE_CASE(Forward)
+          SIMPLE_CASE(Reverse)
+          #undef SIMPLE_CASE
+          }
+          flags = flags.withDifferentiabilityKind(implDiffKind);
         } else if (child->getKind() == NodeKind::ImplEscaping) {
           flags = flags.withEscaping();
         } else if (child->getKind() == NodeKind::ImplParameter) {
@@ -909,9 +1050,88 @@ public:
       return Builder.createSILBoxType(base.getType());
     }
     case NodeKind::SILBoxTypeWithLayout: {
-      // TODO: Implement SILBoxTypeRefs with layout. As a stopgap, specify the
-      // NativeObject type ref.
-      return Builder.createBuiltinType("Builtin.NativeObject", "Bo");
+      llvm::SmallVector<Field, 4> fields;
+      llvm::SmallVector<BuiltSubstitution, 4> substitutions;
+      llvm::SmallVector<BuiltRequirement, 4> requirements;
+
+      if (Node->getNumChildren() < 1)
+        return MAKE_NODE_TYPE_ERROR0(Node, "no children");
+
+      auto fieldsNode = Node->getChild(0);
+      if (fieldsNode->getKind() != NodeKind::SILBoxLayout)
+        return MAKE_NODE_TYPE_ERROR0(fieldsNode, "expected layout");
+      for (auto *fieldNode : *fieldsNode) {
+        bool isMutable;
+        switch (fieldNode->getKind()) {
+        case NodeKind::SILBoxMutableField: isMutable = true; break;
+        case NodeKind::SILBoxImmutableField: isMutable = false; break;
+        default:
+          return MAKE_NODE_TYPE_ERROR0(fieldNode, "unhandled field type");
+        }
+        if (fieldNode->getNumChildren() < 1)
+          return MAKE_NODE_TYPE_ERROR0(fieldNode, "no children");
+        auto type = decodeMangledType(fieldNode->getChild(0));
+        if (type.isError())
+          return type;
+        fields.emplace_back(type.getType(), isMutable);
+      }
+
+      if (Node->getNumChildren() > 1) {
+        auto *substNode = Node->getChild(2);
+        if (substNode->getKind() != NodeKind::TypeList)
+          return MAKE_NODE_TYPE_ERROR0(substNode, "expected type list");
+
+        auto *dependentGenericSignatureNode = Node->getChild(1);
+        if (dependentGenericSignatureNode->getKind() !=
+            NodeKind::DependentGenericSignature)
+          return MAKE_NODE_TYPE_ERROR0(dependentGenericSignatureNode,
+                                       "expected dependent generic signature");
+        if (dependentGenericSignatureNode->getNumChildren() < 1)
+          return MAKE_NODE_TYPE_ERROR(
+              dependentGenericSignatureNode,
+              "fewer children (%zu) than required (1)",
+              dependentGenericSignatureNode->getNumChildren());
+        decodeRequirement<BuiltType, BuiltRequirement, BuiltLayoutConstraint,
+                          BuilderType>(
+            dependentGenericSignatureNode, requirements, Builder/*,
+            [&](NodePointer Node) -> BuiltType {
+              return decodeMangledType(Node).getType();
+            },
+            [&](LayoutConstraintKind Kind) -> BuiltLayoutConstraint {
+              return {}; // Not implemented!
+            },
+            [&](LayoutConstraintKind Kind, unsigned SizeInBits,
+                unsigned Alignment) -> BuiltLayoutConstraint {
+              return {}; // Not Implemented!
+              }*/);
+        // The number of generic parameters at each depth are in a mini
+        // state machine and come first.
+        llvm::SmallVector<unsigned, 4> genericParamsAtDepth;
+        for (auto *reqNode : *dependentGenericSignatureNode)
+          if (reqNode->getKind() == NodeKind::DependentGenericParamCount)
+            if (reqNode->hasIndex())
+              genericParamsAtDepth.push_back(reqNode->getIndex());
+        unsigned depth = 0;
+        unsigned index = 0;
+        for (auto *subst : *substNode) {
+          if (depth >= genericParamsAtDepth.size())
+            return MAKE_NODE_TYPE_ERROR0(
+                dependentGenericSignatureNode,
+                "more substitutions than generic params");
+          while (index >= genericParamsAtDepth[depth])
+            ++depth, index = 0;
+          auto substTy = decodeMangledType(subst);
+          if (substTy.isError())
+            return substTy;
+          substitutions.emplace_back(
+              Builder.createGenericTypeParameterType(depth, index),
+              substTy.getType());
+          ++index;
+        }
+      }
+
+      return Builder.createSILBoxTypeWithLayout(fields, substitutions,
+                                                requirements);
     }
     case NodeKind::SugaredOptional: {
       if (Node->getNumChildren() < 1)
@@ -1053,7 +1273,8 @@ private:
     auto diffKind = T::DifferentiabilityType::DifferentiableOrNotApplicable;
     if (node->getNumChildren() == 3) {
       auto diffKindNode = node->getChild(1);
-      if (diffKindNode->getKind() != Node::Kind::ImplDifferentiability)
+      if (diffKindNode->getKind() !=
+          Node::Kind::ImplParameterResultDifferentiability)
         return true;
       auto optDiffKind =
           T::getDifferentiabilityFromString(diffKindNode->getText());
@@ -1150,33 +1371,44 @@ private:
             FunctionParam<BuiltType> &param) -> bool {
       Demangle::NodePointer node = typeNode;
 
-      auto setOwnership = [&](ValueOwnership ownership) {
-        param.setValueOwnership(ownership);
-        node = node->getFirstChild();
-        hasParamFlags = true;
-      };
-      switch (node->getKind()) {
-      case NodeKind::InOut:
-        setOwnership(ValueOwnership::InOut);
-        break;
+      bool recurse = true;
+      while (recurse) {
+        switch (node->getKind()) {
+        case NodeKind::InOut:
+          param.setValueOwnership(ValueOwnership::InOut);
+          node = node->getFirstChild();
+          hasParamFlags = true;
+          break;
 
-      case NodeKind::Shared:
-        setOwnership(ValueOwnership::Shared);
-        break;
+        case NodeKind::Shared:
+          param.setValueOwnership(ValueOwnership::Shared);
+          node = node->getFirstChild();
+          hasParamFlags = true;
+          break;
 
-      case NodeKind::Owned:
-        setOwnership(ValueOwnership::Owned);
-        break;
+        case NodeKind::Owned:
+          param.setValueOwnership(ValueOwnership::Owned);
+          node = node->getFirstChild();
+          hasParamFlags = true;
+          break;
 
-      case NodeKind::AutoClosureType:
-      case NodeKind::EscapingAutoClosureType: {
-        param.setAutoClosure();
-        hasParamFlags = true;
-        break;
-      }
+        case NodeKind::NoDerivative:
+          param.setNoDerivative();
+          node = node->getFirstChild();
+          hasParamFlags = true;
+          break;
 
-      default:
-        break;
+        case NodeKind::AutoClosureType:
+        case NodeKind::EscapingAutoClosureType:
+          param.setAutoClosure();
+          hasParamFlags = true;
+          recurse = false;
+          break;
+
+        default:
+          recurse = false;
+          break;
+        }
       }
 
       auto paramType = decodeMangledType(node);

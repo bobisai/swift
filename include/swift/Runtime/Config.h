@@ -176,9 +176,15 @@ extern uintptr_t __COMPATIBILITY_LIBRARIES_CANNOT_CHECK_THE_IS_SWIFT_BIT_DIRECTL
 #define SWIFT_INDIRECT_RESULT
 #endif
 
+#if __has_attribute(swift_async_context)
+#define SWIFT_ASYNC_CONTEXT __attribute__((swift_async_context))
+#else
+#define SWIFT_ASYNC_CONTEXT
+#endif
+
 // SWIFT_CC(swiftasync) is the Swift async calling convention.
 // We assume that it supports mandatory tail call elimination.
-#if __has_attribute(swiftasynccall)
+#if __has_feature(swiftasynccc) && __has_attribute(swiftasynccall)
 #define SWIFT_CC_swiftasync __attribute__((swiftasynccall))
 #else
 #define SWIFT_CC_swiftasync SWIFT_CC_swift
@@ -241,6 +247,9 @@ extern uintptr_t __COMPATIBILITY_LIBRARIES_CANNOT_CHECK_THE_IS_SWIFT_BIT_DIRECTL
 #define __ptrauth_swift_escalation_notification_function                       \
   __ptrauth(ptrauth_key_function_pointer, 1,                                   \
             SpecialPointerAuthDiscriminators::EscalationNotificationFunction)
+#define __ptrauth_swift_dispatch_invoke_function                               \
+  __ptrauth(ptrauth_key_process_independent_code, 1,                           \
+            SpecialPointerAuthDiscriminators::DispatchInvokeFunction)
 #define swift_ptrauth_sign_opaque_read_resume_function(__fn, __buffer)         \
   ptrauth_auth_and_resign(__fn, ptrauth_key_function_pointer, 0,               \
                           ptrauth_key_process_independent_code,                \
@@ -266,6 +275,7 @@ extern uintptr_t __COMPATIBILITY_LIBRARIES_CANNOT_CHECK_THE_IS_SWIFT_BIT_DIRECTL
 #define __ptrauth_swift_async_context_yield
 #define __ptrauth_swift_cancellation_notification_function
 #define __ptrauth_swift_escalation_notification_function
+#define __ptrauth_swift_dispatch_invoke_function
 #define __ptrauth_swift_runtime_function_entry
 #define __ptrauth_swift_runtime_function_entry_with_key(__key)
 #define __ptrauth_swift_runtime_function_entry_strip(__fn) (__fn)
@@ -293,9 +303,39 @@ static inline void swift_ptrauth_copy(T *dest, const T *src, unsigned extra) {
 #endif
 }
 
-/// Initialize the destination with an address-discriminated signed pointer.
-/// This does not authenticate the source value, so be careful about how
-/// you construct it.
+/// Copy an address-discriminated signed data pointer from the source
+/// to the destination.
+template <class T>
+SWIFT_RUNTIME_ATTRIBUTE_ALWAYS_INLINE
+static inline void swift_ptrauth_copy_data(T *dest, const T *src,
+                                           unsigned extra) {
+#if SWIFT_PTRAUTH
+  *dest = ptrauth_auth_and_resign(*src,
+                                  ptrauth_key_process_independent_data,
+                                  ptrauth_blend_discriminator(src, extra),
+                                  ptrauth_key_process_independent_data,
+                                  ptrauth_blend_discriminator(dest, extra));
+#else
+  *dest = *src;
+#endif
+}
+
+/// Copy an address-discriminated signed pointer from the source
+/// to the destination.
+template <class T>
+SWIFT_RUNTIME_ATTRIBUTE_ALWAYS_INLINE static inline void
+swift_ptrauth_copy_code_or_data(T *dest, const T *src, unsigned extra,
+                                bool isCode) {
+  if (isCode) {
+    return swift_ptrauth_copy(dest, src, extra);
+  } else {
+    return swift_ptrauth_copy_data(dest, src, extra);
+  }
+}
+
+/// Initialize the destination with an address-discriminated signed
+/// function pointer.  This does not authenticate the source value, so be
+/// careful about how you construct it.
 template <class T>
 SWIFT_RUNTIME_ATTRIBUTE_ALWAYS_INLINE
 static inline void swift_ptrauth_init(T *dest, T value, unsigned extra) {
@@ -309,6 +349,35 @@ static inline void swift_ptrauth_init(T *dest, T value, unsigned extra) {
 #endif
 }
 
+/// Initialize the destination with an address-discriminated signed
+/// data pointer.  This does not authenticate the source value, so be
+/// careful about how you construct it.
+template <class T>
+SWIFT_RUNTIME_ATTRIBUTE_ALWAYS_INLINE
+static inline void swift_ptrauth_init_data(T *dest, T value, unsigned extra) {
+  // FIXME: assert that T is not a function-pointer type?
+#if SWIFT_PTRAUTH
+  *dest = ptrauth_sign_unauthenticated(value,
+                                  ptrauth_key_process_independent_data,
+                                  ptrauth_blend_discriminator(dest, extra));
+#else
+  *dest = value;
+#endif
+}
+
+/// Initialize the destination with an address-discriminated signed
+/// pointer.  This does not authenticate the source value, so be
+/// careful about how you construct it.
+template <class T>
+SWIFT_RUNTIME_ATTRIBUTE_ALWAYS_INLINE static inline void
+swift_ptrauth_init_code_or_data(T *dest, T value, unsigned extra, bool isCode) {
+  if (isCode) {
+    return swift_ptrauth_init(dest, value, extra);
+  } else {
+    return swift_ptrauth_init_data(dest, value, extra);
+  }
+}
+
 template <typename T>
 SWIFT_RUNTIME_ATTRIBUTE_ALWAYS_INLINE
 static inline T swift_auth_data_non_address(T value, unsigned extra) {
@@ -316,6 +385,17 @@ static inline T swift_auth_data_non_address(T value, unsigned extra) {
   return (T)ptrauth_auth_data((void *)value,
                                ptrauth_key_process_independent_data,
                                extra);
+#else
+  return value;
+#endif
+}
+
+template <typename T>
+SWIFT_RUNTIME_ATTRIBUTE_ALWAYS_INLINE static inline T
+swift_auth_code(T value, unsigned extra) {
+#if SWIFT_PTRAUTH
+  return (T)ptrauth_auth_function((void *)value,
+                                  ptrauth_key_process_independent_code, extra);
 #else
   return value;
 #endif

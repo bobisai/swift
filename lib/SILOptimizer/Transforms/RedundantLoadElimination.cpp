@@ -76,8 +76,10 @@
 #include "swift/SIL/Projection.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBuilder.h"
+#include "swift/SIL/BasicBlockBits.h"
 #include "swift/SILOptimizer/Analysis/ARCAnalysis.h"
 #include "swift/SILOptimizer/Analysis/AliasAnalysis.h"
+#include "swift/SILOptimizer/Analysis/DeadEndBlocksAnalysis.h"
 #include "swift/SILOptimizer/Analysis/DominanceAnalysis.h"
 #include "swift/SILOptimizer/Analysis/PostOrderAnalysis.h"
 #include "swift/SILOptimizer/Analysis/ValueTracking.h"
@@ -479,12 +481,10 @@ private:
   /// data flow iteration. For function that requires more than 1 iteration of
   /// the data flow this is populated when the first time the functions is
   /// walked, i.e. when the we generate the genset and killset.
-  llvm::DenseSet<SILBasicBlock *> BBWithLoads;
+  BasicBlockSet BBWithLoads;
 
   /// If set, RLE ignores loads from that array type.
   NominalTypeDecl *ArrayType;
-
-  JointPostDominanceSetComputer &jointPostDomComputer;
 
 #ifndef NDEBUG
   SILPrintContext printCtx;
@@ -493,8 +493,7 @@ private:
 public:
   RLEContext(SILFunction *F, SILPassManager *PM, AliasAnalysis *AA,
              TypeExpansionAnalysis *TE, PostOrderFunctionInfo *PO,
-             EpilogueARCFunctionInfo *EAFI, bool disableArrayLoads,
-             JointPostDominanceSetComputer &computer);
+             EpilogueARCFunctionInfo *EAFI, bool disableArrayLoads);
 
   RLEContext(const RLEContext &) = delete;
   RLEContext(RLEContext &&) = delete;
@@ -541,11 +540,6 @@ public:
 
   /// Return the BlockState for the basic block this basic block belongs to.
   BlockState &getBlockState(SILBasicBlock *B) { return BBToLocState[B]; }
-
-  /// Return the initialized jointPostDomComputer
-  JointPostDominanceSetComputer *getJointPostDomSetComputer() {
-    return &jointPostDomComputer;
-  }
 
   /// Get the bit representing the LSLocation in the LocationVault.
   unsigned getLocationBit(const LSLocation &L);
@@ -691,16 +685,14 @@ SILValue BlockState::reduceValuesAtEndOfBlock(RLEContext &Ctx, LSLocation &L) {
   ValueTableMap &OTM = getForwardValOut();
   for (unsigned i = 0; i < Locs.size(); ++i) {
     auto Val = Ctx.getValue(OTM[Ctx.getLocationBit(Locs[i])]);
-    auto AvailVal = makeCopiedValueAvailable(Val.getBase(), BB,
-                                             Ctx.getJointPostDomSetComputer());
+    auto AvailVal = makeCopiedValueAvailable(Val.getBase(), BB);
     Values[Locs[i]] = LSValue(AvailVal, Val.getPath().getValue());
   }
 
   // Second, reduce the available values into a single SILValue we can use to
   // forward.
   SILValue TheForwardingValue =
-      LSValue::reduce(L, &BB->getModule(), Values, BB->getTerminator(),
-                      Ctx.getJointPostDomSetComputer());
+      LSValue::reduce(L, &BB->getModule(), Values, BB->getTerminator());
   /// Return the forwarding value.
   return TheForwardingValue;
 }
@@ -726,7 +718,7 @@ bool BlockState::setupRLE(RLEContext &Ctx, SILInstruction *I, SILValue Mem) {
   // Reduce the available values into a single SILValue we can use to forward.
   SILModule *Mod = &I->getModule();
   SILValue TheForwardingValue =
-      LSValue::reduce(L, Mod, Values, I, Ctx.getJointPostDomSetComputer());
+      LSValue::reduce(L, Mod, Values, I);
 
   if (!TheForwardingValue)
     return false;
@@ -1143,11 +1135,11 @@ getProcessFunctionKind(unsigned LoadCount, unsigned StoreCount) {
   // Then this function can be processed in one iteration, i.e. no
   // need to generate the genset and killset.
   auto *PO = PM->getAnalysis<PostOrderAnalysis>()->get(Fn);
-  llvm::DenseSet<SILBasicBlock *> HandledBBs;
+  BasicBlockSet HandledBBs(Fn);
   for (SILBasicBlock *B : PO->getReversePostOrder()) {
     ++BBCount;
-    for (auto X : B->getPredecessorBlocks()) {
-      if (HandledBBs.find(X) == HandledBBs.end()) {
+    for (SILBasicBlock *pred : B->getPredecessorBlocks()) {
+      if (!HandledBBs.contains(pred)) {
         RunOneIteration = false;
         break;
       }
@@ -1210,13 +1202,12 @@ void BlockState::dump(RLEContext &Ctx) {
 
 RLEContext::RLEContext(SILFunction *F, SILPassManager *PM, AliasAnalysis *AA,
                        TypeExpansionAnalysis *TE, PostOrderFunctionInfo *PO,
-                       EpilogueARCFunctionInfo *EAFI, bool disableArrayLoads,
-                       JointPostDominanceSetComputer &computer)
+                       EpilogueARCFunctionInfo *EAFI, bool disableArrayLoads)
     : Fn(F), PM(PM), AA(AA), TE(TE), PO(PO), EAFI(EAFI), BBToLocState(F),
+      BBWithLoads(F),
       ArrayType(disableArrayLoads
                     ? F->getModule().getASTContext().getArrayDecl()
-                    : nullptr),
-      jointPostDomComputer(computer)
+                    : nullptr)
 #ifndef NDEBUG
       ,
       printCtx(llvm::dbgs(), /*Verbose=*/false, /*Sorted=*/true)
@@ -1289,20 +1280,15 @@ BlockState::ValueState BlockState::getValueStateAtEndOfBlock(RLEContext &Ctx,
 SILValue RLEContext::computePredecessorLocationValue(SILBasicBlock *BB,
                                                      LSLocation &L) {
   llvm::SmallVector<std::pair<SILBasicBlock *, SILValue>, 8> Values;
-  llvm::DenseSet<SILBasicBlock *> HandledBBs;
-  llvm::SmallVector<SILBasicBlock *, 8> WorkList;
+  BasicBlockWorklist<16> WorkList(Fn);
 
   // Push in all the predecessors to get started.
   for (auto Pred : BB->getPredecessorBlocks()) {
-    WorkList.push_back(Pred);
+    WorkList.pushIfNotVisited(Pred);
   }
 
-  while (!WorkList.empty()) {
-    auto *CurBB = WorkList.pop_back_val();
+  while (SILBasicBlock *CurBB = WorkList.pop()) {
     BlockState &Forwarder = getBlockState(CurBB);
-
-    // Mark this basic block as processed.
-    HandledBBs.insert(CurBB);
 
     // There are 3 cases that can happen here.
     //
@@ -1325,9 +1311,7 @@ SILValue RLEContext::computePredecessorLocationValue(SILBasicBlock *BB,
     // locations, collect in this block's predecessors.
     if (Forwarder.isCoverValues(*this, L)) {
       for (auto Pred : CurBB->getPredecessorBlocks()) {
-        if (HandledBBs.find(Pred) != HandledBBs.end())
-          continue;
-        WorkList.push_back(Pred);
+        WorkList.pushIfNotVisited(Pred);
       }
       continue;
     }
@@ -1341,23 +1325,45 @@ SILValue RLEContext::computePredecessorLocationValue(SILBasicBlock *BB,
 
     // Reduce the available values into a single SILValue we can use to forward
     SILInstruction *IPt = CurBB->getTerminator();
-    Values.push_back({CurBB, LSValue::reduce(L, &BB->getModule(), LSValues, IPt,
-                                             &jointPostDomComputer)});
+    Values.push_back({CurBB, LSValue::reduce(L, &BB->getModule(), LSValues, IPt)});
   }
+
+  auto ownershipRange =
+      makeTransformRange(llvm::make_range(Values.begin(), Values.end()),
+                         [](std::pair<SILBasicBlock *, SILValue> v) {
+                           return v.second.getOwnershipKind();
+                         });
+
+  auto mergedOwnershipKind = ValueOwnershipKind::merge(ownershipRange);
 
   // Finally, collect all the values for the SILArgument, materialize it using
   // the SSAUpdater.
   Updater.initialize(
       L.getType(&BB->getModule(), TypeExpansionContext(*BB->getParent()))
           .getObjectType(),
-      Values[0].second.getOwnershipKind());
+      mergedOwnershipKind);
+
+  SmallVector<SILPhiArgument *, 8> insertedPhis;
+  Updater.setInsertedPhis(&insertedPhis);
 
   for (auto V : Values) {
     Updater.addAvailableValue(V.first, V.second);
   }
 
   auto Val = Updater.getValueInMiddleOfBlock(BB);
-  return makeNewValueAvailable(Val, BB, &jointPostDomComputer);
+
+  for (auto *phi : insertedPhis) {
+    if (phi == Val) {
+      continue;
+    }
+    // Fix lifetime of intermediate phis
+    SmallVector<SILBasicBlock *, 4> userBBs;
+    for (auto use : phi->getUses()) {
+      userBBs.push_back(use->getParentBlock());
+    }
+    endLifetimeAtLeakingBlocks(phi, userBBs);
+  }
+  return makeNewValueAvailable(Val, BB);
 }
 
 bool RLEContext::collectLocationValues(SILBasicBlock *BB, LSLocation &L,
@@ -1375,7 +1381,7 @@ bool RLEContext::collectLocationValues(SILBasicBlock *BB, LSLocation &L,
     auto Val = getValue(VM[getLocationBit(X)]);
     if (!Val.isCoveringValue()) {
       auto AvailValue =
-          makeCopiedValueAvailable(Val.getBase(), BB, &jointPostDomComputer);
+          makeCopiedValueAvailable(Val.getBase(), BB);
       Values[X] = LSValue(AvailValue, Val.getPath().getValue());
       continue;
     }
@@ -1427,7 +1433,7 @@ void RLEContext::processBasicBlocksForGenKillSet() {
     // point in the basic block.
     for (auto I = BB->begin(), E = BB->end(); I != E; ++I) {
       if (auto *LI = dyn_cast<LoadInst>(&*I)) {
-        if (BBWithLoads.find(BB) == BBWithLoads.end())
+        if (!BBWithLoads.contains(BB))
           BBWithLoads.insert(BB);
         S.processLoadInst(*this, LI, RLEKind::ComputeAvailSetMax);
       }
@@ -1445,33 +1451,24 @@ void RLEContext::processBasicBlocksWithGenKillSet() {
   // Process each basic block with the gen and kill set. Every time the
   // ForwardSetOut of a basic block changes, the optimization is rerun on its
   // successors.
-  llvm::SmallVector<SILBasicBlock *, 16> WorkList;
-  llvm::DenseSet<SILBasicBlock *> HandledBBs;
+  BasicBlockWorklist<16> WorkList(Fn);
 
   // Push into the worklist in post order so that we can pop from the back and
   // get reverse post order.
   for (SILBasicBlock *BB : PO->getPostOrder()) {
-    WorkList.push_back(BB);
-    HandledBBs.insert(BB);
+    WorkList.push(BB);
   }
-  while (!WorkList.empty()) {
-    SILBasicBlock *BB = WorkList.pop_back_val();
+  while (SILBasicBlock *BB = WorkList.popAndForget()) {
     LLVM_DEBUG(llvm::dbgs() << "PROCESS " << printCtx.getID(BB)
                             << " with Gen/Kill.\n");
-    HandledBBs.erase(BB);
-
     // Intersection.
     BlockState &Forwarder = getBlockState(BB);
     // Compute the ForwardSetIn at the beginning of the basic block.
     Forwarder.mergePredecessorAvailSet(*this);
 
     if (Forwarder.processBasicBlockWithGenKillSet()) {
-      for (auto &X : BB->getSuccessors()) {
-        // We do not push basic block into the worklist if its already
-        // in the worklist.
-        if (HandledBBs.find(X) != HandledBBs.end())
-          continue;
-        WorkList.push_back(X);
+      for (SILBasicBlock *succ : BB->getSuccessors()) {
+        WorkList.pushIfNotVisited(succ);
       }
     }
     LLVM_DEBUG(Forwarder.dump(*this));
@@ -1514,7 +1511,7 @@ void RLEContext::processBasicBlocksForRLE(bool Optimistic) {
     // and this basic block does not even have LoadInsts, there is no point
     // in processing every instruction in the basic block again as no store
     // will be eliminated. 
-    if (Optimistic && BBWithLoads.find(BB) == BBWithLoads.end())
+    if (Optimistic && !BBWithLoads.contains(BB))
       continue;
 
     BlockState &Forwarder = getBlockState(BB);
@@ -1588,7 +1585,7 @@ bool RLEContext::run() {
 
   // These are a list of basic blocks that we actually processed.
   // We do not process unreachable block, instead we set their liveouts to nil.
-  llvm::DenseSet<SILBasicBlock *> BBToProcess;
+  BasicBlockSet BBToProcess(Fn);
   for (auto X : PO->getPostOrder()) 
     BBToProcess.insert(X);
 
@@ -1596,8 +1593,8 @@ bool RLEContext::run() {
   // know all the locations accessed in this function, we can resize the bit
   // vector to the appropriate size.
   for (auto bs : BBToLocState) {
-    bs.data.init(&bs.block, LocationVault.size(), Optimistic &&
-                 BBToProcess.find(&bs.block) != BBToProcess.end());
+    bs.data.init(&bs.block, LocationVault.size(),
+                 Optimistic && BBToProcess.contains(&bs.block));
   }
 
   LLVM_DEBUG(for (unsigned i = 0; i < LocationVault.size(); ++i) {
@@ -1689,9 +1686,7 @@ public:
     auto *PO = PM->getAnalysis<PostOrderAnalysis>()->get(F);
     auto *EAFI = PM->getAnalysis<EpilogueARCAnalysis>()->get(F);
 
-    DeadEndBlocks deadEndBlocks(F);
-    JointPostDominanceSetComputer computer(deadEndBlocks);
-    RLEContext RLE(F, PM, AA, TE, PO, EAFI, disableArrayLoads, computer);
+    RLEContext RLE(F, PM, AA, TE, PO, EAFI, disableArrayLoads);
     if (RLE.run()) {
       invalidateAnalysis(SILAnalysis::InvalidationKind::Instructions);
     }

@@ -543,7 +543,7 @@ static void printDifferentiableAttrArguments(
   assert(original && "Must resolve original declaration");
 
   // Print comma if not leading clause.
-  bool isLeadingClause = true;
+  bool isLeadingClause = false;
   auto printCommaIfNecessary = [&] {
     if (isLeadingClause) {
       isLeadingClause = false;
@@ -553,9 +553,21 @@ static void printDifferentiableAttrArguments(
   };
 
   // Print if the function is marked as linear.
-  if (attr->isLinear()) {
-    isLeadingClause = false;
-    stream << "linear";
+  switch (attr->getDifferentiabilityKind()) {
+  case DifferentiabilityKind::Normal:
+    isLeadingClause = true;
+    break;
+  case DifferentiabilityKind::Forward:
+    stream << "_forward";
+    break;
+  case DifferentiabilityKind::Reverse:
+    stream << "reverse";
+    break;
+  case DifferentiabilityKind::Linear:
+    stream << "_linear";
+    break;
+  case DifferentiabilityKind::NonDifferentiable:
+    llvm_unreachable("Impossible case `NonDifferentiable`");
   }
 
   // Print differentiation parameters clause, unless it is to be omitted.
@@ -712,6 +724,7 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
   case DAK_ObjCBridged:
   case DAK_SynthesizedProtocol:
   case DAK_Rethrows:
+  case DAK_Reasync:
   case DAK_Infix:
     return false;
   case DAK_Override: {
@@ -1007,6 +1020,8 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
       type.print(Printer, Options);
     else
       attr->getTypeRepr()->print(Printer, Options);
+    if (attr->isArgUnsafe() && Options.IsForSwiftInterface)
+      Printer << "(unsafe)";
     Printer.printNamePost(PrintNameContext::Attribute);
     break;
   }
@@ -1065,6 +1080,20 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
 #define SIMPLE_DECL_ATTR(X, CLASS, ...) case DAK_##CLASS:
 #include "swift/AST/Attr.def"
     llvm_unreachable("handled above");
+
+  case DAK_CompletionHandlerAsync: {
+    auto *attr = cast<CompletionHandlerAsyncAttr>(this);
+    Printer.printAttrName("@completionHandlerAsync");
+    Printer << "(\"";
+    if (attr->AsyncFunctionDecl) {
+      Printer << attr->AsyncFunctionDecl->getName();
+    } else {
+      Printer << attr->AsyncFunctionName;
+    }
+    Printer << "\", completionHandleIndex: " <<
+        attr->CompletionHandlerIndex << ')';
+    break;
+  }
 
   default:
     assert(DeclAttribute::isDeclModifier(getKind()) &&
@@ -1210,6 +1239,8 @@ StringRef DeclAttribute::getAttrName() const {
     return "derivative";
   case DAK_Transpose:
     return "transpose";
+  case DAK_CompletionHandlerAsync:
+    return "completionHandlerAsync";
   }
   llvm_unreachable("bad DeclAttrKind");
 }
@@ -1315,6 +1346,7 @@ SourceLoc ObjCAttr::getRParenLoc() const {
 ObjCAttr *ObjCAttr::clone(ASTContext &context) const {
   auto attr = new (context) ObjCAttr(getName(), isNameImplicit());
   attr->setSwift3Inferred(isSwift3Inferred());
+  attr->setAddedByAccessNote(getAddedByAccessNote());
   return attr;
 }
 
@@ -1667,22 +1699,30 @@ SPIAccessControlAttr::create(ASTContext &context,
 }
 
 DifferentiableAttr::DifferentiableAttr(bool implicit, SourceLoc atLoc,
-                                       SourceRange baseRange, bool linear,
+                                       SourceRange baseRange,
+                                       enum DifferentiabilityKind diffKind,
                                        ArrayRef<ParsedAutoDiffParameter> params,
                                        TrailingWhereClause *clause)
   : DeclAttribute(DAK_Differentiable, atLoc, baseRange, implicit),
-    Linear(linear), NumParsedParameters(params.size()), WhereClause(clause) {
+    DifferentiabilityKind(diffKind), NumParsedParameters(params.size()),
+    WhereClause(clause) {
+  assert((diffKind != DifferentiabilityKind::Normal &&
+          diffKind != DifferentiabilityKind::Forward) &&
+         "'Normal' and 'Forward' are not supported");
   std::copy(params.begin(), params.end(),
             getTrailingObjects<ParsedAutoDiffParameter>());
 }
 
 DifferentiableAttr::DifferentiableAttr(Decl *original, bool implicit,
                                        SourceLoc atLoc, SourceRange baseRange,
-                                       bool linear,
+                                       enum DifferentiabilityKind diffKind,
                                        IndexSubset *parameterIndices,
                                        GenericSignature derivativeGenSig)
     : DeclAttribute(DAK_Differentiable, atLoc, baseRange, implicit),
-      OriginalDeclaration(original), Linear(linear) {
+      OriginalDeclaration(original), DifferentiabilityKind(diffKind) {
+  assert((diffKind != DifferentiabilityKind::Normal &&
+          diffKind != DifferentiabilityKind::Forward) &&
+         "'Normal' and 'Forward' are not supported");
   setParameterIndices(parameterIndices);
   setDerivativeGenericSignature(derivativeGenSig);
 }
@@ -1690,18 +1730,19 @@ DifferentiableAttr::DifferentiableAttr(Decl *original, bool implicit,
 DifferentiableAttr *
 DifferentiableAttr::create(ASTContext &context, bool implicit,
                            SourceLoc atLoc, SourceRange baseRange,
-                           bool linear,
+                           enum DifferentiabilityKind diffKind,
                            ArrayRef<ParsedAutoDiffParameter> parameters,
                            TrailingWhereClause *clause) {
   unsigned size = totalSizeToAlloc<ParsedAutoDiffParameter>(parameters.size());
   void *mem = context.Allocate(size, alignof(DifferentiableAttr));
-  return new (mem) DifferentiableAttr(implicit, atLoc, baseRange, linear,
+  return new (mem) DifferentiableAttr(implicit, atLoc, baseRange, diffKind,
                                       parameters, clause);
 }
 
 DifferentiableAttr *
 DifferentiableAttr::create(AbstractFunctionDecl *original, bool implicit,
-                           SourceLoc atLoc, SourceRange baseRange, bool linear,
+                           SourceLoc atLoc, SourceRange baseRange,
+                           enum DifferentiabilityKind diffKind,
                            IndexSubset *parameterIndices,
                            GenericSignature derivativeGenSig) {
   auto &ctx = original->getASTContext();
@@ -1709,7 +1750,8 @@ DifferentiableAttr::create(AbstractFunctionDecl *original, bool implicit,
   size_t size = totalSizeToAlloc<ParsedAutoDiffParameter>(0); 
   void *mem = ctx.Allocate(size, alignof(DifferentiableAttr));
   return new (mem) DifferentiableAttr(original, implicit, atLoc, baseRange,
-                                      linear, parameterIndices, derivativeGenSig);
+                                      diffKind, parameterIndices,
+                                      derivativeGenSig);
 }
 
 void DifferentiableAttr::setOriginalDeclaration(Decl *originalDeclaration) {
@@ -1908,6 +1950,7 @@ CustomAttr::CustomAttr(SourceLoc atLoc, SourceRange range, TypeExpr *type,
   assert(type);
   hasArgLabelLocs = !argLabelLocs.empty();
   numArgLabels = argLabels.size();
+  isArgUnsafeBit = false;
   initializeCallArguments(argLabels, argLabelLocs);
 }
 
@@ -1948,6 +1991,26 @@ void CustomAttr::resetTypeInformation(TypeExpr *info) { typeExpr = info; }
 void CustomAttr::setType(Type ty) {
   assert(ty);
   typeExpr->setType(MetatypeType::get(ty));
+}
+
+bool CustomAttr::isArgUnsafe() const {
+  if (isArgUnsafeBit)
+    return true;
+
+  auto arg = getArg();
+  if (!arg)
+    return false;
+
+  if (auto parenExpr = dyn_cast<ParenExpr>(arg)) {
+    if (auto declRef =
+            dyn_cast<UnresolvedDeclRefExpr>(parenExpr->getSubExpr())) {
+      if (declRef->getName().isSimpleName("unsafe")) {
+        isArgUnsafeBit = true;
+      }
+    }
+  }
+
+  return isArgUnsafeBit;
 }
 
 void swift::simple_display(llvm::raw_ostream &out, const DeclAttribute *attr) {

@@ -318,7 +318,7 @@ static void initDocGenericParams(const Decl *D, DocEntityInfo &Info,
     if (Proto &&
         Req.getKind() == RequirementKind::Conformance &&
         Req.getFirstType()->isEqual(Proto->getSelfInterfaceType()) &&
-        Req.getSecondType()->getAnyNominal() == Proto)
+        Req.getProtocolDecl() == Proto)
       continue;
 
     auto First = Req.getFirstType();
@@ -426,6 +426,9 @@ static bool initDocEntityInfo(const Decl *D,
   Info.IsUnavailable = AvailableAttr::isUnavailable(D);
   Info.IsDeprecated = D->getAttrs().getDeprecated(D->getASTContext()) != nullptr;
   Info.IsOptional = D->getAttrs().hasAttribute<OptionalAttr>();
+  if (auto *AFD = dyn_cast<AbstractFunctionDecl>(D)) {
+    Info.IsAsync = AFD->hasAsync();
+  }
 
   if (!IsRef) {
     llvm::raw_svector_ostream OS(Info.DocComment);
@@ -465,11 +468,9 @@ static bool initDocEntityInfo(const Decl *D,
       SmallVector<Identifier, 1> Bystanders;
       if (MD->getRequiredBystandersIfCrossImportOverlay(
           DeclaringModForCrossImport, Bystanders)) {
-        std::transform(Bystanders.begin(), Bystanders.end(),
-                       std::back_inserter(Info.RequiredBystanders),
-                       [](Identifier Bystander){
-          return Bystander.str().str();
-        });
+        llvm::transform(
+            Bystanders, std::back_inserter(Info.RequiredBystanders),
+            [](Identifier Bystander) { return Bystander.str().str(); });
       } else {
         llvm_unreachable("DeclaringModForCrossImport not correct?");
       }
@@ -1229,8 +1230,8 @@ public:
   void accept(SourceManager &SM, RegionType RegionType,
               ArrayRef<Replacement> Replacements) {
     unsigned Start = AllEdits.size();
-    std::transform(
-        Replacements.begin(), Replacements.end(), std::back_inserter(AllEdits),
+    llvm::transform(
+        Replacements, std::back_inserter(AllEdits),
         [&](const Replacement &R) -> Edit {
           std::pair<unsigned, unsigned> Start =
                                             SM.getPresumedLineAndColumnForLoc(
@@ -1239,8 +1240,8 @@ public:
                                             R.Range.getEnd());
           SmallVector<NoteRegion, 4> SubRanges;
           auto RawRanges = R.RegionsWorthNote;
-          std::transform(
-              RawRanges.begin(), RawRanges.end(), std::back_inserter(SubRanges),
+          llvm::transform(
+              RawRanges, std::back_inserter(SubRanges),
               [](swift::ide::NoteRegion R) -> SourceKit::NoteRegion {
                 return {SwiftLangSupport::getUIDForRefactoringRangeKind(R.Kind),
                         R.StartLine,
@@ -1523,7 +1524,6 @@ findModuleGroups(StringRef ModuleName, ArrayRef<const char *> Args,
   // Display diagnostics to stderr.
   PrintingDiagnosticConsumer PrintDiags;
   CI.addDiagnosticConsumer(&PrintDiags);
-  std::vector<StringRef> Groups;
   std::string Error;
   if (getASTManager()->initCompilerInvocationNoInputs(Invocation, Args,
                                                      CI.getDiags(), Error)) {
@@ -1550,7 +1550,8 @@ findModuleGroups(StringRef ModuleName, ArrayRef<const char *> Args,
     Receiver(RequestResult<ArrayRef<StringRef>>::fromError(Error));
     return;
   }
-  std::vector<StringRef> Scratch;
-  Receiver(RequestResult<ArrayRef<StringRef>>::fromResult(
-      collectModuleGroups(M, Scratch)));
+
+  llvm::SmallVector<StringRef, 0> Groups;
+  collectModuleGroups(M, Groups);
+  Receiver(RequestResult<ArrayRef<StringRef>>::fromResult(Groups));
 }

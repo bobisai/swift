@@ -507,3 +507,6 @@ extension Slice
     }
   }
 }
+
+extension Slice: Sendable
+where Base: Sendable, Base.Index: Sendable { }

@@ -11,6 +11,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "IRGenModule.h"
+#include "swift/AST/ASTContext.h"
+#include "swift/AST/IRGenOptions.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclGroup.h"
@@ -19,6 +21,7 @@
 #include "clang/AST/GlobalDecl.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/CodeGen/ModuleBuilder.h"
+#include "clang/Sema/Sema.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
 using namespace swift;
@@ -130,6 +133,15 @@ void IRGenModule::emitClangDecl(const clang::Decl *decl) {
     if (isa<clang::FieldDecl>(next)) {
       continue;
     }
+    // If a method calls another method in a class template specialization, we
+    // need to instantiate that other method. Do that here.
+    if (auto *method = dyn_cast<clang::CXXMethodDecl>(next)) {
+      // Make sure that this method is part of a class template specialization.
+      if (method->getTemplateInstantiationPattern())
+        Context.getClangModuleLoader()
+            ->getClangSema()
+            .InstantiateFunctionDefinition(method->getLocation(), method);
+    }
     ClangCodeGen->HandleTopLevelDecl(clang::DeclGroupRef(next));
   }
 }
@@ -145,14 +157,20 @@ IRGenModule::getAddrOfClangGlobalDecl(clang::GlobalDecl global,
 }
 
 void IRGenModule::finalizeClangCodeGen() {
-  // Ensure that code is emitted for any `PragmaCommentDecl`s. (These are
-  // always guaranteed to be directly below the TranslationUnitDecl.)
-  // In Clang, this happens automatically during the Sema phase, but here we
-  // need to take care of it manually because our Clang CodeGenerator is not
-  // attached to Clang Sema as an ASTConsumer.
-  for (const auto *D : ClangASTContext->getTranslationUnitDecl()->decls()) {
-    if (const auto *PCD = dyn_cast<clang::PragmaCommentDecl>(D)) {
-      emitClangDecl(PCD);
+  // FIXME: We try to avoid looking for PragmaCommentDecls unless we need to,
+  // since clang::DeclContext::decls_begin() can trigger expensive
+  // de-serialization.
+  if (Triple.isWindowsMSVCEnvironment() || Triple.isWindowsItaniumEnvironment() ||
+      IRGen.Opts.LLVMLTOKind != IRGenLLVMLTOKind::None) {
+    // Ensure that code is emitted for any `PragmaCommentDecl`s. (These are
+    // always guaranteed to be directly below the TranslationUnitDecl.)
+    // In Clang, this happens automatically during the Sema phase, but here we
+    // need to take care of it manually because our Clang CodeGenerator is not
+    // attached to Clang Sema as an ASTConsumer.
+    for (const auto *D : ClangASTContext->getTranslationUnitDecl()->decls()) {
+      if (const auto *PCD = dyn_cast<clang::PragmaCommentDecl>(D)) {
+        emitClangDecl(PCD);
+      }
     }
   }
 

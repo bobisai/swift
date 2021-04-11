@@ -25,6 +25,7 @@
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILInstruction.h"
+#include "swift/SIL/BasicBlockBits.h"
 #include "swift/SILOptimizer/Analysis/ARCAnalysis.h"
 #include "swift/SILOptimizer/Analysis/AliasAnalysis.h"
 #include "swift/SILOptimizer/Analysis/ArraySemantic.h"
@@ -104,6 +105,7 @@ class COWArrayOpt {
   RCIdentityFunctionInfo *RCIA;
   SILFunction *Function;
   SILLoop *Loop;
+  Optional<SmallVector<SILBasicBlock *, 8>> LoopExitingBlocks;
   SILBasicBlock *Preheader;
   DominanceInfo *DomTree;
   bool HasChanged = false;
@@ -116,7 +118,9 @@ class COWArrayOpt {
   std::pair<bool, bool> CachedSafeLoop;
 
   // Set of all blocks that may reach the loop, not including loop blocks.
-  llvm::SmallPtrSet<SILBasicBlock*,32> ReachingBlocks;
+  BasicBlockSet ReachingBlocks;
+
+  bool reachingBlocksComputed = false;
 
   /// Transient per-Array user set.
   ///
@@ -152,13 +156,13 @@ public:
   COWArrayOpt(RCIdentityFunctionInfo *RCIA, SILLoop *L, DominanceAnalysis *DA)
       : RCIA(RCIA), Function(L->getHeader()->getParent()), Loop(L),
         Preheader(L->getLoopPreheader()), DomTree(DA->get(Function)),
-        ColdBlocks(DA), CachedSafeLoop(false, false) {}
+        ColdBlocks(DA), CachedSafeLoop(false, false), ReachingBlocks(Function) {}
 
   bool run();
 
 private:
   bool checkUniqueArrayContainer(SILValue ArrayContainer);
-  SmallPtrSetImpl<SILBasicBlock*> &getReachingBlocks();
+  BasicBlockSet &getReachingBlocks();
   bool isRetainReleasedBeforeMutate(SILInstruction *RetainInst,
                                     bool IsUniquelyIdentifiedArray = true);
   bool checkSafeArrayAddressUses(UserList &AddressUsers);
@@ -192,6 +196,16 @@ private:
       return inst->getOperand(0);
     return cast<SingleValueInstruction>(inst);
   }
+
+  ArrayRef<SILBasicBlock *> getLoopExitingBlocks() const {
+    if (!LoopExitingBlocks) {
+      auto *self = const_cast<COWArrayOpt *>(this);
+      self->LoopExitingBlocks.emplace();
+      Loop->getExitingBlocks(*self->LoopExitingBlocks);
+    }
+    return *LoopExitingBlocks;
+  }
+
 };
 } // end anonymous namespace
 
@@ -268,18 +282,19 @@ bool COWArrayOpt::checkUniqueArrayContainer(SILValue ArrayContainer) {
 }
 
 /// Lazily compute blocks that may reach the loop.
-SmallPtrSetImpl<SILBasicBlock*> &COWArrayOpt::getReachingBlocks() {
-  if (ReachingBlocks.empty()) {
+BasicBlockSet &COWArrayOpt::getReachingBlocks() {
+  if (!reachingBlocksComputed) {
     SmallVector<SILBasicBlock*, 8> Worklist;
     ReachingBlocks.insert(Preheader);
     Worklist.push_back(Preheader);
     while (!Worklist.empty()) {
       SILBasicBlock *BB = Worklist.pop_back_val();
       for (auto PI = BB->pred_begin(), PE = BB->pred_end(); PI != PE; ++PI) {
-        if (ReachingBlocks.insert(*PI).second)
+        if (ReachingBlocks.insert(*PI))
           Worklist.push_back(*PI);
       }
     }
+    reachingBlocksComputed = true;
   }
   return ReachingBlocks;
 }
@@ -404,7 +419,7 @@ bool COWArrayOpt::checkSafeArrayAddressUses(UserList &AddressUsers) {
 
       // Check of this escape can reach the current loop.
       if (!Loop->contains(UseInst->getParent()) &&
-          !getReachingBlocks().count(UseInst->getParent())) {
+          !getReachingBlocks().contains(UseInst->getParent())) {
         continue;
       }
 
@@ -986,9 +1001,7 @@ bool COWArrayOpt::hoistMakeMutable(ArraySemanticsCall MakeMutable,
 }
 
 bool COWArrayOpt::dominatesExitingBlocks(SILBasicBlock *BB) {
-  llvm::SmallVector<SILBasicBlock *, 8> ExitingBlocks;
-  Loop->getExitingBlocks(ExitingBlocks);
-  for (SILBasicBlock *Exiting : ExitingBlocks) {
+  for (SILBasicBlock *Exiting : getLoopExitingBlocks()) {
     if (!DomTree->dominates(BB, Exiting))
       return false;
   }

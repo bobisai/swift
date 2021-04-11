@@ -288,6 +288,7 @@ protected:
 
   void visitDebugValueInst(DebugValueInst *Inst);
   void visitDebugValueAddrInst(DebugValueAddrInst *Inst);
+  void visitHopToExecutorInst(HopToExecutorInst *Inst);
 
   void visitTerminator(SILBasicBlock *BB);
 
@@ -314,8 +315,7 @@ protected:
     // of the input location.
     return Loc.hasValue()
                ? Loc.getValue()
-               : MandatoryInlinedLocation::getMandatoryInlinedLocation(
-                     (Decl *)nullptr);
+               : MandatoryInlinedLocation();
   }
 
   const SILDebugScope *remapScope(const SILDebugScope *DS) {
@@ -392,10 +392,10 @@ SILInlineCloner::SILInlineCloner(
   // Compute the SILLocation which should be used by all the inlined
   // instructions.
   if (IKind == InlineKind::PerformanceInline)
-    Loc = InlinedLocation::getInlinedLocation(apply.getLoc());
+    Loc = InlinedLocation(apply.getLoc());
   else {
     assert(IKind == InlineKind::MandatoryInline && "Unknown InlineKind.");
-    Loc = MandatoryInlinedLocation::getMandatoryInlinedLocation(apply.getLoc());
+    Loc = MandatoryInlinedLocation(apply.getLoc());
   }
 
   auto applyScope = apply.getDebugScope();
@@ -621,7 +621,15 @@ void SILInlineCloner::visitDebugValueAddrInst(DebugValueAddrInst *Inst) {
 
   return SILCloner<SILInlineCloner>::visitDebugValueAddrInst(Inst);
 }
+void SILInlineCloner::visitHopToExecutorInst(HopToExecutorInst *Inst) {
+  // Drop hop_to_executor in non async functions.
+  if (!Apply.getFunction()->isAsync()) {
+    assert(Apply.isNonAsync());
+    return;
+  }
 
+  return SILCloner<SILInlineCloner>::visitHopToExecutorInst(Inst);
+}
 const SILDebugScope *
 SILInlineCloner::getOrCreateInlineScope(const SILDebugScope *CalleeScope) {
   if (!CalleeScope)

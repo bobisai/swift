@@ -57,6 +57,7 @@ _SUPPORTED_XCODE_BUILDS = [
     ("12.2 Release Candidate", "12B5044c"),
     ("12.2", "12B45b"),
     ("12.3", "12C33"),
+    ("12.4", "12D4e"),
 ]
 
 # -----------------------------------------------------------------------------
@@ -336,6 +337,13 @@ def apply_default_arguments(toolchain, args):
         args.build_subdir = \
             workspace.compute_build_subdir(args)
 
+    if args.relocate_xdg_cache_home_under_build_subdir:
+        cache_under_build_subdir = os.path.join(
+            SWIFT_BUILD_ROOT, args.build_subdir, '.cache')
+        if args.verbose_build:
+            print("Relocating XDG_CACHE_HOME to {}".format(cache_under_build_subdir))
+        workspace.relocate_xdg_cache_home_under(cache_under_build_subdir)
+
     if args.install_destdir is None:
         args.install_destdir = os.path.join(
             SWIFT_BUILD_ROOT, args.build_subdir,
@@ -601,6 +609,9 @@ class BuildScriptInvocation(object):
         if not args.build_benchmarks:
             impl_args += ["--skip-build-benchmarks"]
 
+        if args.swift_disable_dead_stripping:
+            args.extra_cmake_options.append('-DSWIFT_DISABLE_DEAD_STRIPPING:BOOL=TRUE')
+
         # Then add subproject install flags that either skip building them /or/
         # if we are going to build them and install_all is set, we also install
         # them.
@@ -785,6 +796,11 @@ class BuildScriptInvocation(object):
                 "--llvm-install-components=%s" % args.llvm_install_components
             ]
 
+        if not args.clean_llbuild:
+            impl_args += [
+                "--skip-clean-llbuild"
+            ]
+
         # Compute the set of host-specific variables, which we pass through to
         # the build script via environment variables.
         host_specific_variables = self.compute_host_specific_variables()
@@ -875,8 +891,6 @@ class BuildScriptInvocation(object):
         product_classes = []
         if self.args.build_swiftpm:
             product_classes.append(products.SwiftPM)
-        if self.args.build_swift_driver or self.args.install_swift_driver:
-            product_classes.append(products.SwiftDriver)
         if self.args.build_swiftsyntax:
             product_classes.append(products.SwiftSyntax)
         if self.args.build_skstresstester:
@@ -897,6 +911,13 @@ class BuildScriptInvocation(object):
             product_classes.append(products.SwiftInspect)
         if self.args.tsan_libdispatch_test:
             product_classes.append(products.TSanLibDispatch)
+
+        # Keep SwiftDriver at last.
+        # swift-driver's integration with the build scripts is not fully
+        # supported. Using swift-driver to build these products may hit
+        # failures.
+        if self.args.build_swift_driver or self.args.install_swift_driver:
+            product_classes.append(products.SwiftDriver)
         # Sanity check that all of our non-impl classes are actually
         # not build_script_impl products.
         for prod in product_classes:
@@ -1303,6 +1324,12 @@ def main_normal():
         toolchain.libtool = args.host_libtool
     if args.cmake is not None:
         toolchain.cmake = args.cmake
+    if args.sccache:
+        print("Ensuring the sccache server is running...")
+        # Use --show-stats to ensure the server is started, because using
+        # --start-server will fail if the server is already running.
+        # Capture the output because we don't want to see the stats.
+        shell.capture([toolchain.sccache, "--show-stats"])
 
     cmake = CMake(args=args, toolchain=toolchain)
     # Check the CMake version is sufficient on Linux and build from source

@@ -5,9 +5,6 @@
 
 // REQUIRES: objc_interop
 
-// FIXME(rdar://64425653): We should re-enable this test for other platforms.
-// REQUIRES: OS=macosx
-
 import Foundation
 import PrivateObjC
 
@@ -215,6 +212,7 @@ type(of: obj).foo!(obj)(5) // expected-error{{instance member 'foo' cannot be us
 // Checked casts to AnyObject
 var p: P = Y()
 var obj3 : AnyObject = (p as! AnyObject)! // expected-error{{cannot force unwrap value of non-optional type 'AnyObject'}} {{41-42=}}
+// expected-warning@-1{{forced cast from 'P' to 'AnyObject' always succeeds; did you mean to use 'as'?}} {{27-30=as}}
 
 // Implicit force of an implicitly unwrapped optional
 let uopt : AnyObject! = nil
@@ -341,8 +339,10 @@ func testOverloadedWithUnavailable(ao: AnyObject) {
 }
 
 func dynamicInitCrash(ao: AnyObject.Type) {
+  // This is going to produce difference results on macOS/iOS due to
+  // different availability of `init(...)` overloads attached to `AnyObject`
   let sdk = ao.init(blahblah: ())
-  // expected-error@-1 {{no exact matches in call to initializer}}
+  // expected-error@-1 {{}}
 }
 
 // Test that we correctly diagnose ambiguity for different typed members available

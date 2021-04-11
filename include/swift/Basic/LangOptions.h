@@ -55,6 +55,20 @@ namespace swift {
     Complete,
   };
 
+  /// Access or distribution level of a library.
+  enum class LibraryLevel : uint8_t {
+    /// Application Programming Interface that is publicly distributed so
+    /// public decls are really public and only @_spi decls are SPI.
+    API,
+
+    /// System Programming Interface that has restricted distribution
+    /// all decls in the module are considered to be SPI including public ones.
+    SPI,
+
+    /// The library has some other undefined distribution.
+    Other
+  };
+
   /// A collection of options that affect the language dialect and
   /// provide compiler debugging facilities.
   class LangOptions final {
@@ -81,6 +95,9 @@ namespace swift {
 
     /// The target variant SDK version, if known.
     Optional<llvm::VersionTuple> VariantSDKVersion;
+
+    /// The alternate name to use for the entry point instead of main.
+    std::string entryPointFunctionName = "main";
 
     ///
     /// Language features
@@ -235,17 +252,29 @@ namespace swift {
     /// optimized custom allocator, so that memory debugging tools can be used.
     bool UseMalloc = false;
 
+    /// Provide additional warnings about code that is unsafe in the
+    /// eventual Swift concurrency model, and will eventually become errors
+    /// in a future Swift language version, but are too noisy for existing
+    /// language modes.
+    bool WarnConcurrency = false;
+
     /// Enable experimental #assert feature.
     bool EnableExperimentalStaticAssert = false;
 
     /// Enable experimental concurrency model.
     bool EnableExperimentalConcurrency = false;
 
+    /// Enable experimental asyncHandler support.
+    bool EnableExperimentalAsyncHandler = false;
+
+    /// Enable experimental flow-sensitive concurrent captures.
+    bool EnableExperimentalFlowSensitiveConcurrentCaptures = false;
+
+    /// Enable inference of Sendable conformances for public types.
+    bool EnableInferPublicSendable = false;
+
     /// Disable the implicit import of the _Concurrency module.
     bool DisableImplicitConcurrencyModuleImport = false;
-
-    /// Enable experimental support for `@_specialize(exported: true,...)` .
-    bool EnableExperimentalPrespecialization = false;
 
     /// Should we check the target OSs of serialized modules to see that they're
     /// new enough?
@@ -275,13 +304,6 @@ namespace swift {
     /// [TODO: Clang-type-plumbing] Turn on for feature rollout.
     bool UseClangFunctionTypes = false;
 
-    /// Whether to use the import as member inference system
-    ///
-    /// When importing a global, try to infer whether we can import it as a
-    /// member of some type instead. This includes inits, computed properties,
-    /// and methods.
-    bool InferImportAsMember = false;
-
     /// If set to true, compile with the SIL Opaque Values enabled.
     /// This is for bootstrapping. It can't be in SILOptions because the
     /// TypeChecker uses it to set resolve the ParameterConvention.
@@ -294,6 +316,9 @@ namespace swift {
     /// Whether to enable Swift 3 @objc inference, e.g., for members of
     /// Objective-C-derived classes and 'dynamic' members.
     bool EnableSwift3ObjCInference = false;
+
+    /// Access or distribution level of the whole module being parsed.
+    LibraryLevel LibraryLevel = LibraryLevel::Other;
 
     /// Warn about cases where Swift 3 would infer @objc but later versions
     /// of Swift do not.
@@ -366,6 +391,20 @@ namespace swift {
     // Allow errors during module generation. See corresponding option in
     // FrontendOptions.
     bool AllowModuleWithCompilerErrors = false;
+
+    /// A helper enum to represent whether or not we customized the default
+    /// ASTVerifier behavior via a frontend flag. By default, we do not
+    /// customize.
+    ///
+    /// NOTE: The default behavior is to run the ASTVerifier only when asserts
+    /// are enabled. This just allows for one to customize that behavior.
+    enum class ASTVerifierOverrideKind {
+      NoOverride = 0,
+      EnableVerifier = 1,
+      DisableVerifier = 2,
+    };
+    ASTVerifierOverrideKind ASTVerifierOverride =
+        ASTVerifierOverrideKind::NoOverride;
 
     /// Sets the target we are building for and updates platform conditions
     /// to match.
@@ -547,6 +586,9 @@ namespace swift {
     /// Enable experimental support for one-way constraints for the
     /// parameters of closures.
     bool EnableOneWayClosureParameters = false;
+
+    /// See \ref FrontendOptions.PrintFullConvention
+    bool PrintFullConvention = false;
   };
 
   /// Options for controlling the behavior of the Clang importer.
@@ -612,13 +654,6 @@ namespace swift {
     /// instead of dropped altogether when possible.
     bool ImportForwardDeclarations = false;
 
-    /// Whether to use the import as member inference system
-    ///
-    /// When importing a global, try to infer whether we can import it as a
-    /// member of some type instead. This includes inits, computed properties,
-    /// and methods.
-    bool InferImportAsMember = false;
-
     /// If true ignore the swift bridged attribute.
     bool DisableSwiftBridgeAttr = false;
 
@@ -651,7 +686,6 @@ namespace swift {
                           static_cast<uint8_t>(Mode),
                           DetailedPreprocessingRecord,
                           ImportForwardDeclarations,
-                          InferImportAsMember,
                           DisableSwiftBridgeAttr,
                           DisableOverlayModules);
     }

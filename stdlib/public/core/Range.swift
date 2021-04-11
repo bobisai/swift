@@ -1017,3 +1017,9 @@ public typealias CountableRange<Bound: Strideable> = Range<Bound>
 // shorthand. TODO: Add documentation
 public typealias CountablePartialRangeFrom<Bound: Strideable> = PartialRangeFrom<Bound>
   where Bound.Stride: SignedInteger
+
+extension Range: Sendable where Bound: Sendable { }
+extension PartialRangeUpTo: Sendable where Bound: Sendable { }
+extension PartialRangeThrough: Sendable where Bound: Sendable { }
+extension PartialRangeFrom: Sendable where Bound: Sendable { }
+extension PartialRangeFrom.Iterator: Sendable where Bound: Sendable { }

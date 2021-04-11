@@ -6,60 +6,48 @@ enum PictureData {
   case failedToLoadImagePlaceholder
 }
 
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
 func test_cancellation_checkCancellation() async throws {
-  try await Task.checkCancellation()
+  try Task.checkCancellation()
 }
 
-func test_cancellation_guard_isCanceled(_ any: Any) async -> PictureData {
-  guard await !Task.isCanceled() else {
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
+func test_cancellation_guard_isCancelled(_ any: Any) async -> PictureData {
+  guard !Task.isCancelled else {
     return PictureData.failedToLoadImagePlaceholder
   }
 
   return PictureData.value("...")
 }
 
-struct SomeFile {
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
+struct SomeFile: Sendable {
   func close() {}
 }
 
-func test_cancellation_withCancellationHandler(_ anything: Any) async -> PictureData {
-  let handle = Task.runDetached { () -> PictureData in
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
+func test_cancellation_withTaskCancellationHandler(_ anything: Any) async -> PictureData {
+  let handle: Task.Handle<PictureData, Error> = detach {
     let file = SomeFile()
 
-    return try await Task.withCancellationHandler(
-      handler: { file.close() },
-      operation: {
-      await test_cancellation_guard_isCanceled(file)
-    })
+    return await withTaskCancellationHandler(
+      handler: { file.close() }) {
+      await test_cancellation_guard_isCancelled(file)
+    }
   }
 
   handle.cancel()
 }
 
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
 func test_cancellation_loop() async -> Int {
   struct SampleTask { func process() async {} }
 
   let tasks = [SampleTask(), SampleTask()]
   var processed = 0
-  for t in tasks where await !Task.isCanceled() {
+  for t in tasks where !Task.isCancelled {
     await t.process()
     processed += 1
   }
   return processed
-}
-
-// ==== Deadlines --------------------------------------------------------------
-
-func int() async -> Int { 42 }
-
-func test_cancellation_withDeadline_in() async throws -> Int {
-  await Task.withDeadline(in: .seconds(5), operation: {
-    await int()
-  })
-}
-
-func test_cancellation_withDeadline(specificDeadline: Task.Deadline) async -> Int {
-  await Task.withDeadline(specificDeadline) {
-    await int()
-  }
 }

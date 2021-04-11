@@ -162,6 +162,7 @@ KNOWN_SETTINGS=(
 
     ## llbuild Options
     llbuild-enable-assertions                     "1"               "enable assertions in llbuild"
+    skip-clean-llbuild                            "0"               "skip cleaning up llbuild"
 
     ## LLDB Options
     lldb-assertions                               "1"               "build lldb with assertions enabled"
@@ -199,6 +200,7 @@ KNOWN_SETTINGS=(
     swift-stdlib-single-threaded-runtime          "0"               "whether to build stdlib as a single-threaded runtime only"
     swift-stdlib-os-versioning                    "1"               "whether to build stdlib with availability based on OS versions (Darwin only)"
     swift-stdlib-stable-abi                       ""                "should stdlib be built with stable ABI, if not set defaults to true on Darwin, false otherwise"
+    swift-disable-dead-stripping                  "0"               "turns off Darwin-specific dead stripping for Swift host tools"
 
     ## FREESTANDING Stdlib Options
     swift-freestanding-sdk                      ""                "which SDK to use when building the FREESTANDING stdlib"
@@ -243,12 +245,16 @@ components=(
   xctest
 )
 for component in ${components[@]} ; do
+  component_skip_test_default=""
+  if [[ "${component}" == "cmark" ]]; then
+    component_skip_test_default="1"
+  fi
   KNOWN_SETTINGS+=(
-    ${component}-build-type                       "Debug"           "the build variant for ${component}"
-    ${component}-cmake-options                    ""                "CMake options used for ${component}"
-    skip-build-${component}                       ""                "set to skip building ${component}"
-    skip-test-${component}                        ""                "set to skip testing ${component}"
-    install-${component}                          ""                "whether to install ${component}"
+    ${component}-build-type                       "Debug"                              "the build variant for ${component}"
+    ${component}-cmake-options                    ""                                   "CMake options used for ${component}"
+    skip-build-${component}                       ""                                   "set to skip building ${component}"
+    skip-test-${component}                        "${component_skip_test_default}"     "set to skip testing ${component}"
+    install-${component}                          ""                                   "whether to install ${component}"
   )
 done
 
@@ -469,11 +475,11 @@ function set_build_options_for_host() {
             fi
             case ${host} in
                 android-aarch64)
-                    SWIFT_HOST_TRIPLE="aarch64-unknown-linux-android"
+                    SWIFT_HOST_TRIPLE="aarch64-unknown-linux-android${ANDROID_API_LEVEL}"
                     llvm_target_arch="AArch64"
                     ;;
                 android-armv7)
-                    SWIFT_HOST_TRIPLE="armv7-unknown-linux-androideabi"
+                    SWIFT_HOST_TRIPLE="armv7-unknown-linux-androideabi${ANDROID_API_LEVEL}"
                     llvm_target_arch="ARM"
                     ;;
                 android-x86_64)
@@ -1292,19 +1298,19 @@ function common_cross_c_flags() {
             echo -n " -arch ${arch} -target ${arch}-apple-macosx${SWIFT_DARWIN_DEPLOYMENT_VERSION_OSX}"
             ;;
         iphonesimulator-*)
-            echo -n " -arch ${arch} -target ${arch}-apple-ios-simulator${DARWIN_DEPLOYMENT_VERSION_IOS}"
+            echo -n " -arch ${arch} -target ${arch}-apple-ios${DARWIN_DEPLOYMENT_VERSION_IOS}-simulator"
             ;;
         iphoneos-*)
-            echo -n " -arch ${arch} -target ${arch}-apple-iphoneos${DARWIN_DEPLOYMENT_VERSION_IOS}"
+            echo -n " -arch ${arch} -target ${arch}-apple-ios${DARWIN_DEPLOYMENT_VERSION_IOS}"
             ;;
         appletvsimulator-*)
-            echo -n " -arch ${arch} -target ${arch}-apple-tvos-simulator${DARWIN_DEPLOYMENT_VERSION_TVOS}"
+            echo -n " -arch ${arch} -target ${arch}-apple-tvos${DARWIN_DEPLOYMENT_VERSION_TVOS}-simulator"
             ;;
         appletvos-*)
             echo -n " -arch ${arch} -target ${arch}-apple-tvos${DARWIN_DEPLOYMENT_VERSION_TVOS}"
             ;;
         watchsimulator-*)
-            echo -n " -arch ${arch} -target ${arch}-apple-watchos-simulator${DARWIN_DEPLOYMENT_VERSION_WATCHOS}"
+            echo -n " -arch ${arch} -target ${arch}-apple-watchos${DARWIN_DEPLOYMENT_VERSION_WATCHOS}-simulator"
             ;;
         watchos-*)
             echo -n " -arch ${arch} -target ${arch}-apple-watchos${DARWIN_DEPLOYMENT_VERSION_WATCHOS}"
@@ -1410,7 +1416,7 @@ function copy_embedded_compiler_rt_builtins_from_darwin_host_toolchain() {
                 if [[ ! -f "${DEST_LIB_PATH}" ]]; then
                     if [[ -f "${HOST_LIB_PATH}" ]]; then
                         if [[ "$OS" == "tvos" ]]; then
-                           call lipo -remove i386 "${HOST_LIB_PATH}" -output "${DEST_LIB_PATH}"
+                           call lipo -remove i386 "${HOST_LIB_PATH}" -output "${DEST_LIB_PATH}" || call cp "${HOST_LIB_PATH}" "${DEST_LIB_PATH}"
                         else
                            call cp "${HOST_LIB_PATH}" "${DEST_LIB_PATH}"
                         fi
@@ -1426,7 +1432,7 @@ function copy_embedded_compiler_rt_builtins_from_darwin_host_toolchain() {
                 if [[ ! -f "${DEST_SIM_LIB_PATH}" ]]; then
                     if [[ -f "${HOST_SIM_LIB_PATH}" ]]; then
                         if [[ "$OS" == "tvos" ]]; then
-                           call lipo -remove i386 "${HOST_SIM_LIB_PATH}" -output "${DEST_SIM_LIB_PATH}"
+                           call lipo -remove i386 "${HOST_SIM_LIB_PATH}" -output "${DEST_SIM_LIB_PATH}" || call cp "${HOST_SIM_LIB_PATH}" "${DEST_SIM_LIB_PATH}"
                         else
                            call cp "${HOST_SIM_LIB_PATH}" "${DEST_SIM_LIB_PATH}"
                         fi
@@ -2183,6 +2189,15 @@ for host in "${ALL_HOSTS[@]}"; do
 
                         -DSQLite3_INCLUDE_DIR:PATH="$(xcrun -sdk macosx -show-sdk-path)/usr/include"
                     )
+                fi
+
+                if [[ "${SKIP_CLEAN_LLBUILD}" == "0" ]]
+                then
+                  # Ensure llbuild will rebuild from scratch, since
+                  # arbitrary changes to the compiler can prevent
+                  # a successful incremental build
+                  echo "Cleaning the llbuild build directory"
+                  call rm -rf "$(build_directory ${host} llbuild)"
                 fi
                 ;;
             xctest)
@@ -3241,11 +3256,11 @@ function build_and_test_installable_package() {
             with_pushd "${PKG_TESTS_SANDBOX_PARENT}" \
                 call tar xzf "${package_for_host}"
 
-            if python -c "import psutil" ; then
+            if python3 -c "import psutil" ; then
               TIMEOUT_ARGS=--timeout=1200 # 20 minutes
             fi
             with_pushd "${PKG_TESTS_SOURCE_DIR}" \
-                call python "${LIT_EXECUTABLE_PATH}" . -sv --param package-path="${PKG_TESTS_SANDBOX}" --param test-exec-root="${PKG_TESTS_TEMPS}" --param llvm-bin-dir="${LLVM_BIN_DIR}" ${TIMEOUT_ARGS}
+                call python3 "${LIT_EXECUTABLE_PATH}" . -sv --param package-path="${PKG_TESTS_SANDBOX}" --param test-exec-root="${PKG_TESTS_TEMPS}" --param llvm-bin-dir="${LLVM_BIN_DIR}" ${TIMEOUT_ARGS}
         fi
     fi
 }

@@ -27,9 +27,6 @@
 #include "swift/SIL/SILLinkage.h"
 #include "swift/SIL/SILPrintContext.h"
 
-/// The symbol name used for the program entry point function.
-#define SWIFT_ENTRY_POINT_FUNCTION "main"
-
 namespace swift {
 
 class ASTContext;
@@ -199,7 +196,7 @@ private:
 
   /// A monotonically increasing ID which is incremented whenever a
   /// BasicBlockBitfield is constructed.
-  /// Usually this stays below 1000, so a 32-bit unsigned is more than
+  /// Usually this stays below 100000, so a 32-bit unsigned is more than
   /// sufficient.
   /// For details see BasicBlockBitfield::bitfieldID;
   unsigned currentBitfieldID = 1;
@@ -1149,6 +1146,9 @@ public:
   /// verify - Run the IR verifier to make sure that the SILFunction follows
   /// invariants.
   void verify(bool SingleFunction = true) const;
+
+  /// Verifies the lifetime of memory locations in the function.
+  void verifyMemoryLifetime();
 
   /// Run the SIL ownership verifier to check for ownership invariant failures.
   ///

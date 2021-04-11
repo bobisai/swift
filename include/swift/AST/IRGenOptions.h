@@ -23,6 +23,7 @@
 #include "swift/Basic/Sanitizers.h"
 #include "swift/Basic/OptionSet.h"
 #include "swift/Basic/OptimizationMode.h"
+#include "swift/Config.h"
 #include "clang/Basic/PointerAuthOptions.h"
 // FIXME: This include is just for llvm::SanitizerCoverageOptions. We should
 // split the header upstream so we don't include so much.
@@ -39,7 +40,10 @@ enum class IRGenOutputKind : unsigned {
   Module,
 
   /// Generate an LLVM module and write it out as LLVM assembly.
-  LLVMAssembly,
+  LLVMAssemblyBeforeOptimization,
+
+  /// Generate an LLVM module and write it out as LLVM assembly.
+  LLVMAssemblyAfterOptimization,
 
   /// Generate an LLVM module and write it out as LLVM bitcode.
   LLVMBitcode,
@@ -138,6 +142,26 @@ struct PointerAuthOptions : clang::PointerAuthOptions {
   /// Resilient class stub initializer callbacks.
   PointerAuthSchema ResilientClassStubInitCallbacks;
 
+  /// Like SwiftFunctionPointers but for use with AsyncFunctionPointer values.
+  PointerAuthSchema AsyncSwiftFunctionPointers;
+
+  /// Like SwiftClassMethods but for use with AsyncFunctionPointer values.
+  PointerAuthSchema AsyncSwiftClassMethods;
+
+  /// Like ProtocolWitnesses but for use with AsyncFunctionPointer values.
+  PointerAuthSchema AsyncProtocolWitnesses;
+
+  /// Like SwiftClassMethodPointers but for use with AsyncFunctionPointer
+  /// values.
+  PointerAuthSchema AsyncSwiftClassMethodPointers;
+
+  /// Like SwiftDynamicReplacements but for use with AsyncFunctionPointer
+  /// values.
+  PointerAuthSchema AsyncSwiftDynamicReplacements;
+
+  /// Like PartialApplyCapture but for use with AsyncFunctionPointer values.
+  PointerAuthSchema AsyncPartialApplyCapture;
+
   /// The parent async context stored within a child async context.
   PointerAuthSchema AsyncContextParent;
 
@@ -146,6 +170,12 @@ struct PointerAuthOptions : clang::PointerAuthOptions {
 
   /// The resume function stored in AsyncTask.
   PointerAuthSchema TaskResumeFunction;
+
+  /// The async context stored in AsyncTask.
+  PointerAuthSchema TaskResumeContext;
+
+  /// The swift async context entry in the extended frame info.
+  PointerAuthSchema AsyncContextExtendedFrameEntry;
 };
 
 enum class JITDebugArtifact : unsigned {
@@ -347,7 +377,8 @@ public:
   JITDebugArtifact DumpJIT = JITDebugArtifact::None;
 
   IRGenOptions()
-      : DWARFVersion(2), OutputKind(IRGenOutputKind::LLVMAssembly),
+      : DWARFVersion(2),
+        OutputKind(IRGenOutputKind::LLVMAssemblyAfterOptimization),
         Verify(true), OptMode(OptimizationMode::NotSet),
         Sanitizers(OptionSet<SanitizerKind>()),
         SanitizersWithRecoveryInstrumentation(OptionSet<SanitizerKind>()),
@@ -394,7 +425,8 @@ public:
     if (HasValueNamesSetting) {
       return ValueNames;
     } else {
-      return OutputKind == IRGenOutputKind::LLVMAssembly;
+      return OutputKind == IRGenOutputKind::LLVMAssemblyBeforeOptimization ||
+             OutputKind == IRGenOutputKind::LLVMAssemblyAfterOptimization;
     }
   }
 

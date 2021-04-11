@@ -140,8 +140,8 @@ PASS(DCE, "dce",
      "Dead Code Elimination")
 PASS(DeadArgSignatureOpt, "dead-arg-signature-opt",
      "Dead Argument Elimination via Function Specialization")
-PASS(DeadFunctionElimination, "sil-deadfuncelim",
-     "Dead Function Elimination")
+PASS(DeadFunctionAndGlobalElimination, "sil-deadfuncelim",
+     "Dead Function and Global Variable Elimination")
 PASS(DeadObjectElimination, "deadobject-elim",
      "Dead Object Elimination for Classes with Trivial Destruction")
 PASS(DefiniteInitialization, "definite-init",
@@ -154,6 +154,8 @@ PASS(DiagnoseInfiniteRecursion, "diagnose-infinite-recursion",
      "Diagnose Infinitely-Recursive Code")
 PASS(DiagnoseInvalidEscapingCaptures, "diagnose-invalid-escaping-captures",
      "Diagnose Invalid Escaping Captures")
+PASS(DiagnoseLifetimeIssues, "diagnose-lifetime-issues",
+     "Diagnose Lifetime Issues")
 PASS(DiagnoseStaticExclusivity, "diagnose-static-exclusivity",
      "Static Enforcement of Law of Exclusivity")
 PASS(DiagnoseUnreachable, "diagnose-unreachable",
@@ -200,14 +202,16 @@ PASS(GlobalOpt, "global-opt",
      "SIL Global Optimization")
 PASS(GlobalPropertyOpt, "global-property-opt",
      "Global Property Optimization")
-PASS(GuaranteedARCOpts, "guaranteed-arc-opts",
-     "Guaranteed ARC Optimization")
+PASS(MandatoryARCOpts, "mandatory-arc-opts",
+     "Mandatory ARC Optimization")
 PASS(HighLevelCSE, "high-level-cse",
      "Common Subexpression Elimination on High-Level SIL")
 PASS(HighLevelLICM, "high-level-licm",
      "Loop Invariant Code Motion in High-Level SIL")
 PASS(IVInfoPrinter, "iv-info-printer",
      "Print Induction Variable Information for Testing")
+PASS(LowerHopToActor, "lower-hop-to-actor",
+     "Lower hop_to_executor instructions with actor operands")
 PASS(OptimizeHopToExecutor, "optimize-hop-to-executor",
      "Optimize hop_to_executor instructions for actor isolated code")
 PASS(InstCount, "inst-count",
@@ -220,8 +224,8 @@ PASS(LICM, "licm",
      "Loop Invariant Code Motion")
 PASS(LateCodeMotion, "late-codemotion",
      "Late Code Motion with Release Hoisting")
-PASS(LateDeadFunctionElimination, "late-deadfuncelim",
-     "Late Dead Function Elimination")
+PASS(LateDeadFunctionAndGlobalElimination, "late-deadfuncelim",
+     "Late Dead Function and Global Elimination")
 PASS(LateInliner, "late-inline",
      "Late Function Inlining")
 PASS(LoopCanonicalizer, "loop-canonicalizer",

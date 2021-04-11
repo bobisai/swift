@@ -72,7 +72,7 @@ PrintOptions SymbolGraph::getDeclarationFragmentsPrintOptions() const {
   Opts.SkipUnderscoredStdlibProtocols = true;
   Opts.PrintGenericRequirements = true;
   Opts.PrintInherited = false;
-  Opts.ExplodeEnumCaseDecls = IsForSingleNode;
+  Opts.ExplodeEnumCaseDecls = true;
 
   Opts.ExclusiveAttrList.clear();
 
@@ -339,9 +339,10 @@ void SymbolGraph::recordConformanceSynthesizedMemberRelationships(Symbol S) {
     return;
   }
 
-  SynthesizedExtensionAnalyzer
-  ExtensionAnalyzer(const_cast<NominalTypeDecl*>(OwningNominal),
-      PrintOptions::printModuleInterface());
+  SynthesizedExtensionAnalyzer ExtensionAnalyzer(
+      const_cast<NominalTypeDecl *>(OwningNominal),
+      PrintOptions::printModuleInterface(
+          OwningNominal->getASTContext().TypeCheckerOpts.PrintFullConvention));
   auto MergeGroupKind = SynthesizedExtensionAnalyzer::MergeGroupKind::All;
   ExtensionAnalyzer.forEachExtensionMergeGroup(MergeGroupKind,
       [&](ArrayRef<ExtensionInfo> ExtensionInfos){
@@ -532,11 +533,9 @@ void SymbolGraph::serialize(llvm::json::OStream &OS) {
           case FileUnitKind::Synthesized:
             llvm_unreachable("Unexpected module kind: Synthesized");
             break;
-          case FileUnitKind::Source: {
-            auto Target = MainFile->getASTContext().LangOpts.Target;
-            symbolgraphgen::serialize(Target, OS);
+          case FileUnitKind::Source:
+            symbolgraphgen::serialize(M.getASTContext().LangOpts.Target, OS);
             break;
-          }
           case FileUnitKind::SerializedAST: {
             auto SerializedAST = cast<SerializedASTFile>(MainFile);
             auto Target = llvm::Triple(SerializedAST->getTargetTriple());
@@ -595,17 +594,9 @@ void
 SymbolGraph::serializeNavigatorDeclarationFragments(StringRef Key,
                                                     const Symbol &S,
                                                     llvm::json::OStream &OS) {
-  DeclarationFragmentPrinter Printer(this, OS, Key);
-
   if (const auto *TD = dyn_cast<GenericTypeDecl>(S.getSymbolDecl())) {
+    DeclarationFragmentPrinter Printer(this, OS, Key);
     Printer.printAbridgedType(TD, /*PrintKeyword=*/false);
-  } else {
-    auto Options = getSubHeadingDeclarationFragmentsPrintOptions();
-    if (S.getBaseType()) {
-      Options.setBaseType(S.getBaseType());
-      Options.PrintAsMember = true;
-    }
-    S.getSymbolDecl()->print(Printer, Options);
   }
 }
 

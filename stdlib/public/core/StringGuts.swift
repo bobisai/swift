@@ -18,7 +18,7 @@ import SwiftShims
 //
 @frozen
 public // SPI(corelibs-foundation)
-struct _StringGuts {
+struct _StringGuts: UnsafeSendable {
   @usableFromInline
   internal var _object: _StringObject
 

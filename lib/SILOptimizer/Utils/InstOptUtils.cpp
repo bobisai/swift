@@ -14,6 +14,7 @@
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/SemanticAttrs.h"
 #include "swift/AST/SubstitutionMap.h"
+#include "swift/Basic/SmallPtrSetVector.h"
 #include "swift/SIL/ApplySite.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/DebugUtils.h"
@@ -602,17 +603,8 @@ void swift::recursivelyDeleteTriviallyDeadInstructions(
 
       // If we have a function ref inst, we need to especially drop its function
       // argument so that it gets a proper ref decrement.
-      auto *fri = dyn_cast<FunctionRefInst>(inst);
-      if (fri && fri->getInitiallyReferencedFunction())
+      if (auto *fri = dyn_cast<FunctionRefBaseInst>(inst))
         fri->dropReferencedFunction();
-
-      auto *dfri = dyn_cast<DynamicFunctionRefInst>(inst);
-      if (dfri && dfri->getInitiallyReferencedFunction())
-        dfri->dropReferencedFunction();
-
-      auto *pfri = dyn_cast<PreviousDynamicFunctionRefInst>(inst);
-      if (pfri && pfri->getInitiallyReferencedFunction())
-        pfri->dropReferencedFunction();
     }
 
     for (auto inst : deadInsts) {
@@ -701,11 +693,9 @@ SILValue swift::
 getConcreteValueOfExistentialBox(AllocExistentialBoxInst *existentialBox,
                                   SILInstruction *ignoreUser) {
   StoreInst *singleStore = nullptr;
-  SmallVector<Operand *, 32> worklist;
-  SmallPtrSet<Operand *, 8> addedToWorklistPreviously;
+  SmallPtrSetVector<Operand *, 32> worklist;
   for (auto *use : getNonDebugUses(existentialBox)) {
-    worklist.push_back(use);
-    addedToWorklistPreviously.insert(use);
+    worklist.insert(use);
   }
 
   while (!worklist.empty()) {
@@ -722,8 +712,7 @@ getConcreteValueOfExistentialBox(AllocExistentialBoxInst *existentialBox,
       // Look through copy_value, begin_borrow
       for (SILValue result : user->getResults())
         for (auto *transitiveUse : result->getUses())
-          if (!addedToWorklistPreviously.insert(transitiveUse).second)
-            worklist.push_back(use);
+          worklist.insert(transitiveUse);
       break;
     case SILInstructionKind::ProjectExistentialBoxInst: {
       auto *projectedAddr = cast<ProjectExistentialBoxInst>(user);
@@ -810,20 +799,6 @@ getConcreteValueOfExistentialBoxAddr(SILValue addr, SILInstruction *ignoreUser) 
     return SILValue();
 
   return getConcreteValueOfExistentialBox(box, singleStackStore);
-}
-
-// Devirtualization of functions with covariant return types produces
-// a result that is not an apply, but takes an apply as an
-// argument. Attempt to dig the apply out from this result.
-FullApplySite swift::findApplyFromDevirtualizedResult(SILValue v) {
-  if (auto Apply = FullApplySite::isa(v))
-    return Apply;
-
-  if (isa<UpcastInst>(v) || isa<EnumInst>(v) || isa<UncheckedRefCastInst>(v))
-    return findApplyFromDevirtualizedResult(
-        cast<SingleValueInstruction>(v)->getOperand(0));
-
-  return FullApplySite();
 }
 
 bool swift::mayBindDynamicSelf(SILFunction *F) {
@@ -961,12 +936,23 @@ SILLinkage swift::getSpecializedLinkage(SILFunction *f, SILLinkage linkage) {
 /// to avoid any divergence between the check and the implementation in the
 /// future.
 ///
+/// \p usePoints are required when \p value has guaranteed ownership. It must be
+/// the last users of the returned, casted value. A usePoint cannot be a
+/// BranchInst (a phi is never the last guaranteed user). \p builder's current
+/// insertion point must dominate all \p usePoints. \p usePoints must
+/// collectively post-dominate \p builder's current insertion point.
+///
 /// NOTE: The implementation of this function is very closely related to the
-/// rules checked by SILVerifier::requireABICompatibleFunctionTypes.
+/// rules checked by SILVerifier::requireABICompatibleFunctionTypes. It must
+/// handle all cases recognized by SILFunctionType::isABICompatibleWith (see
+/// areABICompatibleParamsOrReturns()).
 std::pair<SILValue, bool /* changedCFG */>
 swift::castValueToABICompatibleType(SILBuilder *builder, SILLocation loc,
                                     SILValue value, SILType srcTy,
-                                    SILType destTy) {
+                                    SILType destTy,
+                                    ArrayRef<SILInstruction *> usePoints) {
+  assert(value.getOwnershipKind() != OwnershipKind::Guaranteed
+         || !usePoints.empty() && "guaranteed value must have use points");
 
   // No cast is required if types are the same.
   if (srcTy == destTy)
@@ -1019,38 +1005,71 @@ swift::castValueToABICompatibleType(SILBuilder *builder, SILLocation loc,
 
     // Unwrap the original optional value.
     auto *someDecl = builder->getASTContext().getOptionalSomeDecl();
-    auto *noneBB = builder->getFunction().createBasicBlock();
-    auto *someBB = builder->getFunction().createBasicBlock();
     auto *curBB = builder->getInsertionPoint()->getParent();
-
     auto *contBB = curBB->split(builder->getInsertionPoint());
-    contBB->createPhiArgument(destTy, OwnershipKind::Owned);
+    auto *someBB = builder->getFunction().createBasicBlockAfter(curBB);
+    auto *noneBB = builder->getFunction().createBasicBlockAfter(someBB);
+
+    auto *phi = contBB->createPhiArgument(destTy, value.getOwnershipKind());
+    if (phi->getOwnershipKind() == OwnershipKind::Guaranteed) {
+      auto createEndBorrow = [&](SILBasicBlock::iterator insertPt) {
+        builder->setInsertionPoint(insertPt);
+        builder->createEndBorrow(loc, phi);
+      };
+      for (SILInstruction *user : usePoints) {
+        if (isa<TermInst>(user)) {
+          assert(!isa<BranchInst>(user) && "no branch as guaranteed use point");
+          for (auto *succBB : user->getParent()->getSuccessorBlocks()) {
+            createEndBorrow(succBB->begin());
+          }
+          continue;
+        }
+        createEndBorrow(std::next(user->getIterator()));
+      }
+    }
 
     SmallVector<std::pair<EnumElementDecl *, SILBasicBlock *>, 1> caseBBs;
     caseBBs.push_back(std::make_pair(someDecl, someBB));
     builder->setInsertionPoint(curBB);
     builder->createSwitchEnum(loc, value, noneBB, caseBBs);
-
-    // Handle the Some case.
-    builder->setInsertionPoint(someBB);
-    SILValue unwrappedValue =
-        builder->createUncheckedEnumData(loc, value, someDecl);
+    // In OSSA switch_enum destinations have terminator results.
+    //
+    // TODO: This should be in a switchEnum utility.
+    SILValue unwrappedValue;
+    if (builder->hasOwnership()) {
+      // Create a terminator result, NOT a phi, despite the API name.
+      noneBB->createPhiArgument(value->getType(), OwnershipKind::None);
+      unwrappedValue =
+        someBB->createPhiArgument(optionalSrcTy, value.getOwnershipKind());
+      builder->setInsertionPoint(someBB);
+    } else {
+      builder->setInsertionPoint(someBB);
+      unwrappedValue = builder->createUncheckedEnumData(loc, value, someDecl);
+    }
     // Cast the unwrapped value.
     SILValue castedUnwrappedValue;
     std::tie(castedUnwrappedValue, std::ignore) = castValueToABICompatibleType(
-        builder, loc, unwrappedValue, optionalSrcTy, optionalDestTy);
-    // Wrap into optional.
-    auto castedValue =
+      builder, loc, unwrappedValue, optionalSrcTy, optionalDestTy, usePoints);
+    // Wrap into optional. An owned value is forwarded through the cast and into
+    // the Optional. A borrowed value will have a nested borrow for the
+    // rewrapped Optional.
+    SILValue someValue =
         builder->createOptionalSome(loc, castedUnwrappedValue, destTy);
-    builder->createBranch(loc, contBB, {castedValue});
+    if (phi->getOwnershipKind() == OwnershipKind::Guaranteed) {
+       someValue = builder->createBeginBorrow(loc, someValue);
+    }
+    builder->createBranch(loc, contBB, {someValue});
 
     // Handle the None case.
     builder->setInsertionPoint(noneBB);
-    castedValue = builder->createOptionalNone(loc, destTy);
-    builder->createBranch(loc, contBB, {castedValue});
+    SILValue noneValue = builder->createOptionalNone(loc, destTy);
+    if (phi->getOwnershipKind() == OwnershipKind::Guaranteed) {
+       noneValue = builder->createBeginBorrow(loc, noneValue);
+    }
+    builder->createBranch(loc, contBB, {noneValue});
     builder->setInsertionPoint(contBB->begin());
 
-    return {contBB->getArgument(0), true};
+    return {phi, true};
   }
 
   // Src is not optional, but dest is optional.
@@ -1065,7 +1084,8 @@ swift::castValueToABICompatibleType(SILBuilder *builder, SILLocation loc,
         builder->createOptionalSome(loc, value, loweredOptionalSrcType);
     // Cast the wrapped value.
     return castValueToABICompatibleType(builder, loc, wrappedValue,
-                                        wrappedValue->getType(), destTy);
+                                        wrappedValue->getType(), destTy,
+                                        usePoints);
   }
 
   // Handle tuple types.
@@ -1073,17 +1093,16 @@ swift::castValueToABICompatibleType(SILBuilder *builder, SILLocation loc,
   if (auto srcTupleTy = srcTy.getAs<TupleType>()) {
     SmallVector<SILValue, 8> expectedTuple;
     bool changedCFG = false;
-    for (unsigned i = 0, e = srcTupleTy->getNumElements(); i < e; ++i) {
-      SILValue element = builder->createTupleExtract(loc, value, i);
+    auto castElement = [&](unsigned idx, SILValue element) {
       // Cast the value if necessary.
       bool neededCFGChange;
       std::tie(element, neededCFGChange) = castValueToABICompatibleType(
-          builder, loc, element, srcTy.getTupleElementType(i),
-          destTy.getTupleElementType(i));
+          builder, loc, element, srcTy.getTupleElementType(idx),
+          destTy.getTupleElementType(idx), usePoints);
       changedCFG |= neededCFGChange;
       expectedTuple.push_back(element);
-    }
-
+    };
+    builder->emitDestructureValueOperation(loc, value, castElement);
     return {builder->createTuple(loc, destTy, expectedTuple), changedCFG};
   }
 
@@ -1889,21 +1908,25 @@ swift::cloneFullApplySiteReplacingCallee(FullApplySite applySite,
     auto *tai = cast<TryApplyInst>(applySite.getInstruction());
     return builder.createTryApply(tai->getLoc(), newCallee,
                                   tai->getSubstitutionMap(), arguments,
-                                  tai->getNormalBB(), tai->getErrorBB());
+                                  tai->getNormalBB(), tai->getErrorBB(),
+                                  tai->getApplyOptions());
   }
   case FullApplySiteKind::ApplyInst: {
     auto *ai = cast<ApplyInst>(applySite);
     auto fTy = newCallee->getType().getAs<SILFunctionType>();
 
+    auto options = ai->getApplyOptions();
     // The optimizer can generate a thin_to_thick_function from a throwing thin
     // to a non-throwing thick function (in case it can prove that the function
     // is not throwing).
     // Therefore we have to check if the new callee (= the argument of the
     // thin_to_thick_function) is a throwing function and set the not-throwing
     // flag in this case.
+    if (fTy->hasErrorResult())
+      options |= ApplyFlags::DoesNotThrow;
     return builder.createApply(applySite.getLoc(), newCallee,
                                applySite.getSubstitutionMap(), arguments,
-                               ai->isNonThrowing() || fTy->hasErrorResult());
+                               options);
   }
   case FullApplySiteKind::BeginApplyInst: {
     llvm_unreachable("begin_apply support not implemented?!");
@@ -1991,9 +2014,7 @@ SILBasicBlock::iterator swift::replaceSingleUse(Operand *use, SILValue newValue,
   return nextII;
 }
 
-SILValue swift::makeCopiedValueAvailable(
-    SILValue value, SILBasicBlock *inBlock,
-    JointPostDominanceSetComputer *jointPostDomComputer) {
+SILValue swift::makeCopiedValueAvailable(SILValue value, SILBasicBlock *inBlock) {
   if (!value->getFunction()->hasOwnership())
     return value;
 
@@ -2001,15 +2022,14 @@ SILValue swift::makeCopiedValueAvailable(
     return value;
 
   auto insertPt = getInsertAfterPoint(value).getValue();
-  auto *copy =
-      SILBuilderWithScope(insertPt).createCopyValue(insertPt->getLoc(), value);
+  SILBuilderWithScope builder(insertPt);
+  auto *copy = builder.createCopyValue(
+      RegularLocation::getAutoGeneratedLocation(), value);
 
-  return makeNewValueAvailable(copy, inBlock, jointPostDomComputer);
+  return makeNewValueAvailable(copy, inBlock);
 }
 
-SILValue swift::makeNewValueAvailable(
-    SILValue value, SILBasicBlock *inBlock,
-    JointPostDominanceSetComputer *jointPostDomComputer) {
+SILValue swift::makeNewValueAvailable(SILValue value, SILBasicBlock *inBlock) {
   if (!value->getFunction()->hasOwnership())
     return value;
 
@@ -2023,20 +2043,80 @@ SILValue swift::makeNewValueAvailable(
   // 1. Create a control equivalent copy at \p inBlock if needed
   // 2. Insert destroy_value at leaking blocks
   SILValue controlEqCopy;
-  jointPostDomComputer->findJointPostDominatingSet(
+  findJointPostDominatingSet(
       value->getParentBlock(), inBlock,
       [&](SILBasicBlock *loopBlock) {
         assert(loopBlock == inBlock);
         auto front = loopBlock->begin();
         SILBuilderWithScope newBuilder(front);
-        controlEqCopy = newBuilder.createCopyValue(front->getLoc(), value);
+        controlEqCopy = newBuilder.createCopyValue(
+            RegularLocation::getAutoGeneratedLocation(), value);
       },
       [&](SILBasicBlock *postDomBlock) {
         // Insert a destroy_value in the leaking block
         auto front = postDomBlock->begin();
         SILBuilderWithScope newBuilder(front);
-        newBuilder.createDestroyValue(front->getLoc(), value);
+        newBuilder.createDestroyValue(
+            RegularLocation::getAutoGeneratedLocation(), value);
       });
 
   return controlEqCopy ? controlEqCopy : value;
+}
+
+bool swift::tryEliminateOnlyOwnershipUsedForwardingInst(
+    SingleValueInstruction *forwardingInst, InstModCallbacks &callbacks) {
+  if (!OwnershipForwardingMixin::isa(forwardingInst) ||
+      isa<AllArgOwnershipForwardingSingleValueInst>(forwardingInst))
+    return false;
+
+  SmallVector<Operand *, 32> worklist(getNonDebugUses(forwardingInst));
+  while (!worklist.empty()) {
+    auto *use = worklist.pop_back_val();
+    auto *user = use->getUser();
+
+    if (isa<EndBorrowInst>(user) || isa<DestroyValueInst>(user) ||
+        isa<RefCountingInst>(user))
+      continue;
+
+    if (isa<CopyValueInst>(user) || isa<BeginBorrowInst>(user)) {
+      for (auto result : user->getResults())
+        for (auto *resultUse : getNonDebugUses(result))
+          worklist.push_back(resultUse);
+      continue;
+    }
+
+    return false;
+  }
+
+  // Now that we know we can perform our transform, set all uses of
+  // forwardingInst to be used of its operand and then delete \p forwardingInst.
+  auto newValue = forwardingInst->getOperand(0);
+  while (!forwardingInst->use_empty()) {
+    auto *use = *(forwardingInst->use_begin());
+    use->set(newValue);
+  }
+
+  callbacks.deleteInst(forwardingInst);
+  return true;
+}
+
+// The consuming use blocks are assumed either not to inside a loop relative to
+// \p value or they must have their own copies.
+void swift::endLifetimeAtLeakingBlocks(SILValue value,
+                                       ArrayRef<SILBasicBlock *> uses) {
+  if (!value->getFunction()->hasOwnership())
+    return;
+
+  if (value.getOwnershipKind() != OwnershipKind::Owned)
+    return;
+
+  findJointPostDominatingSet(
+      value->getParentBlock(), uses, [&](SILBasicBlock *loopBlock) {},
+      [&](SILBasicBlock *postDomBlock) {
+        // Insert a destroy_value in the leaking block
+        auto front = postDomBlock->begin();
+        SILBuilderWithScope newBuilder(front);
+        newBuilder.createDestroyValue(
+            RegularLocation::getAutoGeneratedLocation(), value);
+      });
 }

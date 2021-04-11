@@ -266,8 +266,7 @@ irgen::enumerateGenericSignatureRequirements(CanGenericSignature signature,
 
       case RequirementKind::Conformance: {
         auto type = CanType(reqt.getFirstType());
-        auto protocol =
-          cast<ProtocolType>(CanType(reqt.getSecondType()))->getDecl();
+        auto protocol = reqt.getProtocolDecl();
         if (Lowering::TypeConverter::protocolRequiresWitnessTable(protocol)) {
           callback({type, protocol});
         }
@@ -926,7 +925,7 @@ static bool isDependentConformance(
     if (req.getKind() != RequirementKind::Conformance)
       continue;
 
-    auto assocProtocol = req.getSecondType()->castTo<ProtocolType>()->getDecl();
+    auto assocProtocol = req.getProtocolDecl();
     if (assocProtocol->isObjC())
       continue;
 
@@ -1334,6 +1333,8 @@ public:
 #endif
 
       SILFunction *Func = entry.getMethodWitness().Witness;
+      auto *afd = cast<AbstractFunctionDecl>(
+          entry.getMethodWitness().Requirement.getDecl());
       llvm::Constant *witness = nullptr;
       if (Func) {
         if (Func->isAsync()) {
@@ -1344,11 +1345,20 @@ public:
       } else {
         // The method is removed by dead method elimination.
         // It should be never called. We add a pointer to an error function.
-        witness = IGM.getDeletedMethodErrorFn();
+        if (afd->hasAsync()) {
+          witness = llvm::ConstantExpr::getBitCast(
+              IGM.getDeletedAsyncMethodErrorAsyncFunctionPointer(),
+              IGM.FunctionPtrTy);
+        } else {
+          witness = llvm::ConstantExpr::getBitCast(
+              IGM.getDeletedMethodErrorFn(), IGM.FunctionPtrTy);
+        }
       }
       witness = llvm::ConstantExpr::getBitCast(witness, IGM.Int8PtrTy);
 
-      auto &schema = IGM.getOptions().PointerAuth.ProtocolWitnesses;
+      PointerAuthSchema schema =
+          afd->hasAsync() ? IGM.getOptions().PointerAuth.AsyncProtocolWitnesses
+                          : IGM.getOptions().PointerAuth.ProtocolWitnesses;
       Table.addSignedPointer(witness, schema, requirement);
       return;
     }
@@ -1678,7 +1688,10 @@ void ResilientWitnessTableBuilder::collectResilientWitnesses(
     SILFunction *Func = entry.getMethodWitness().Witness;
     llvm::Constant *witness;
     if (Func) {
-      witness = IGM.getAddrOfSILFunction(Func, NotForDefinition);
+      if (Func->isAsync())
+        witness = IGM.getAddrOfAsyncFunctionPointer(Func);
+      else
+        witness = IGM.getAddrOfSILFunction(Func, NotForDefinition);
     } else {
       // The method is removed by dead method elimination.
       // It should be never called. We add a null pointer.
@@ -2145,7 +2158,7 @@ void IRGenModule::emitSILWitnessTable(SILWitnessTable *wt) {
   IRGen.ensureRelativeSymbolCollocation(*wt);
 
   auto conf = wt->getConformance();
-  PrettyStackTraceConformance _st(Context, "emitting witness table for", conf);
+  PrettyStackTraceConformance _st("emitting witness table for", conf);
 
   unsigned tableSize = 0;
   llvm::GlobalVariable *global = nullptr;
@@ -2798,8 +2811,7 @@ void NecessaryBindings::addAbstractConditionalRequirements(
   for (auto req : condRequirements) {
     if (req.getKind() != RequirementKind::Conformance)
       continue;
-    auto *proto =
-        req.getSecondType()->castTo<ProtocolType>()->getDecl();
+    auto *proto = req.getProtocolDecl();
     auto ty = req.getFirstType()->getCanonicalType();
     auto archetype = dyn_cast<ArchetypeType>(ty);
     if (!archetype)
@@ -3058,20 +3070,6 @@ NecessaryBindings NecessaryBindings::computeBindings(
   // Figure out what we're actually required to pass:
   PolymorphicConvention convention(IGM, origType, considerParameterSources);
 
-  //  - unfulfilled requirements
-  convention.enumerateUnfulfilledRequirements(
-                                        [&](GenericRequirement requirement) {
-    CanType type = requirement.TypeParameter.subst(subs)->getCanonicalType();
-
-    if (requirement.Protocol) {
-      auto conf = subs.lookupConformance(requirement.TypeParameter,
-                                         requirement.Protocol);
-      bindings.addProtocolConformance(type, conf);
-    } else {
-      bindings.addTypeMetadata(type);
-    }
-  });
-
   //   - extra sources
   for (auto &source : convention.getSources()) {
     switch (source.getKind()) {
@@ -3097,6 +3095,20 @@ NecessaryBindings NecessaryBindings::computeBindings(
     }
     llvm_unreachable("bad source kind");
   }
+
+  //  - unfulfilled requirements
+  convention.enumerateUnfulfilledRequirements(
+                                        [&](GenericRequirement requirement) {
+    CanType type = requirement.TypeParameter.subst(subs)->getCanonicalType();
+
+    if (requirement.Protocol) {
+      auto conf = subs.lookupConformance(requirement.TypeParameter,
+                                         requirement.Protocol);
+      bindings.addProtocolConformance(type, conf);
+    } else {
+      bindings.addTypeMetadata(type);
+    }
+  });
 
   return bindings;
 }
@@ -3352,7 +3364,9 @@ FunctionPointer irgen::emitWitnessMethodValue(IRGenFunction &IGF,
   witnessFnPtr = IGF.Builder.CreateBitCast(witnessFnPtr,
                                            signature.getType()->getPointerTo());
 
-  auto &schema = IGF.getOptions().PointerAuth.ProtocolWitnesses;
+  auto &schema = fnType->isAsync()
+                     ? IGF.getOptions().PointerAuth.AsyncProtocolWitnesses
+                     : IGF.getOptions().PointerAuth.ProtocolWitnesses;
   auto authInfo = PointerAuthInfo::emit(IGF, schema, slot, member);
 
   return FunctionPointer(fnType, witnessFnPtr, authInfo, signature);

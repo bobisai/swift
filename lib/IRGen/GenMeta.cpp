@@ -116,6 +116,7 @@ void IRGenModule::setTrueConstGlobal(llvm::GlobalVariable *var) {
   disableAddressSanitizer(*this, var);
   
   switch (TargetInfo.OutputObjectFormat) {
+  case llvm::Triple::GOFF:
   case llvm::Triple::UnknownObjectFormat:
     llvm_unreachable("unknown object format");
   case llvm::Triple::MachO:
@@ -261,7 +262,10 @@ static Flags getMethodDescriptorFlags(ValueDecl *fn) {
     }
     llvm_unreachable("bad kind");
   }();
-  return Flags(kind).withIsInstance(!fn->isStatic());
+  bool hasAsync = false;
+  if (auto *afd = dyn_cast<AbstractFunctionDecl>(fn))
+    hasAsync = afd->hasAsync();
+  return Flags(kind).withIsInstance(!fn->isStatic()).withIsAsync(hasAsync);
 }
 
 static void buildMethodDescriptorFields(IRGenModule &IGM,
@@ -278,7 +282,9 @@ static void buildMethodDescriptorFields(IRGenModule &IGM,
     flags = flags.withIsDynamic(true);
 
   // Include the pointer-auth discriminator.
-  if (auto &schema = IGM.getOptions().PointerAuth.SwiftClassMethods) {
+  if (auto &schema = func->hasAsync()
+                         ? IGM.getOptions().PointerAuth.AsyncSwiftClassMethods
+                         : IGM.getOptions().PointerAuth.SwiftClassMethods) {
     auto discriminator =
       PointerAuthInfo::getOtherDiscriminator(IGM, schema, fn);
     flags = flags.withExtraDiscriminator(discriminator->getZExtValue());
@@ -289,8 +295,14 @@ static void buildMethodDescriptorFields(IRGenModule &IGM,
 
   if (auto entry = VTable->getEntry(IGM.getSILModule(), fn)) {
     assert(entry->getKind() == SILVTable::Entry::Kind::Normal);
-    auto *implFn = IGM.getAddrOfSILFunction(entry->getImplementation(),
-                                            NotForDefinition);
+
+    auto *impl = entry->getImplementation();
+    llvm::Constant *implFn;
+    if (impl->isAsync())
+      implFn = IGM.getAddrOfAsyncFunctionPointer(impl);
+    else
+      implFn = IGM.getAddrOfSILFunction(impl, NotForDefinition);
+
     descriptor.addRelativeAddress(implFn);
   } else {
     // The method is removed by dead method elimination.
@@ -485,7 +497,7 @@ namespace {
     }
     
     void addName() {
-      B.addRelativeAddress(IGM.getAddrOfGlobalString(M->getName().str(),
+      B.addRelativeAddress(IGM.getAddrOfGlobalString(M->getABIName().str(),
                                            /*willBeRelativelyAddressed*/ true));
     }
     
@@ -1607,6 +1619,10 @@ namespace {
 
         if (MetadataLayout->hasResilientSuperclass())
           flags.class_setHasResilientSuperclass(true);
+
+        if (getType()->isDefaultActor(IGM.getSwiftModule(),
+                                      ResilienceExpansion::Maximal))
+          flags.class_setIsDefaultActor(true);
       }
 
       if (ResilientSuperClassRef) {
@@ -1757,8 +1773,14 @@ namespace {
       // The implementation of the override.
       if (auto entry = VTable->getEntry(IGM.getSILModule(), baseRef)) {
         assert(entry->getKind() == SILVTable::Entry::Kind::Override);
-        auto *implFn = IGM.getAddrOfSILFunction(entry->getImplementation(),
-                                                NotForDefinition);
+
+        auto *impl = entry->getImplementation();
+        llvm::Constant *implFn;
+        if (impl->isAsync())
+          implFn = IGM.getAddrOfAsyncFunctionPointer(impl);
+        else
+          implFn = IGM.getAddrOfSILFunction(impl, NotForDefinition);
+
         descriptor.addRelativeAddress(implFn);
       } else {
         // The method is removed by dead method elimination.
@@ -3146,6 +3168,7 @@ namespace {
       // Find the vtable entry.
       assert(VTable && "no vtable?!");
       auto entry = VTable->getEntry(IGM.getSILModule(), fn);
+      auto *afd = cast<AbstractFunctionDecl>(fn.getDecl());
 
       // The class is fragile. Emit a direct reference to the vtable entry.
       llvm::Constant *ptr;
@@ -3159,11 +3182,19 @@ namespace {
       } else {
         // The method is removed by dead method elimination.
         // It should be never called. We add a pointer to an error function.
-        ptr = llvm::ConstantExpr::getBitCast(IGM.getDeletedMethodErrorFn(),
-                                             IGM.FunctionPtrTy);
+        if (afd->hasAsync()) {
+          ptr = llvm::ConstantExpr::getBitCast(
+              IGM.getDeletedAsyncMethodErrorAsyncFunctionPointer(),
+              IGM.FunctionPtrTy);
+        } else {
+          ptr = llvm::ConstantExpr::getBitCast(IGM.getDeletedMethodErrorFn(),
+                                               IGM.FunctionPtrTy);
+        }
       }
 
-      auto &schema = IGM.getOptions().PointerAuth.SwiftClassMethods;
+      PointerAuthSchema schema =
+          afd->hasAsync() ? IGM.getOptions().PointerAuth.AsyncSwiftClassMethods
+                          : IGM.getOptions().PointerAuth.SwiftClassMethods;
       B.addSignedPointer(ptr, schema, fn);
     }
 
@@ -5080,7 +5111,9 @@ SpecialProtocol irgen::getSpecialProtocolID(ProtocolDecl *P) {
     
   // The other known protocols aren't special at runtime.
   case KnownProtocolKind::Sequence:
+  case KnownProtocolKind::AsyncSequence:
   case KnownProtocolKind::IteratorProtocol:
+  case KnownProtocolKind::AsyncIteratorProtocol:
   case KnownProtocolKind::RawRepresentable:
   case KnownProtocolKind::Equatable:
   case KnownProtocolKind::Hashable:
@@ -5123,6 +5156,8 @@ SpecialProtocol irgen::getSpecialProtocolID(ProtocolDecl *P) {
   case KnownProtocolKind::Differentiable:
   case KnownProtocolKind::FloatingPoint:
   case KnownProtocolKind::Actor:
+  case KnownProtocolKind::Sendable:
+  case KnownProtocolKind::UnsafeSendable:
     return SpecialProtocol::None;
   }
 
@@ -5134,6 +5169,10 @@ SpecialProtocol irgen::getSpecialProtocolID(ProtocolDecl *P) {
 /// that the ObjC runtime uses for uniquing.
 void IRGenModule::emitProtocolDecl(ProtocolDecl *protocol) {
   PrettyStackTraceDecl stackTraceRAII("emitting metadata for", protocol);
+
+  // Marker protocols are never emitted.
+  if (protocol->isMarkerProtocol())
+    return;
 
   // Emit remote reflection metadata for the protocol.
   emitFieldDescriptor(protocol);
@@ -5198,10 +5237,10 @@ GenericRequirementsMetadata irgen::addGenericRequirements(
   assert(sig);
   GenericRequirementsMetadata metadata;
   for (auto &requirement : requirements) {
-    ++metadata.NumRequirements;
-
     switch (auto kind = requirement.getKind()) {
     case RequirementKind::Layout:
+      ++metadata.NumRequirements;
+
       switch (auto layoutKind =
                 requirement.getLayoutConstraint()->getKind()) {
       case LayoutConstraintKind::Class: {
@@ -5222,8 +5261,14 @@ GenericRequirementsMetadata irgen::addGenericRequirements(
       break;
 
     case RequirementKind::Conformance: {
-      auto protocol = requirement.getSecondType()->castTo<ProtocolType>()
-        ->getDecl();
+      auto protocol = requirement.getProtocolDecl();
+
+      // Marker protocols do not record generic requirements at all.
+      if (protocol->isMarkerProtocol()) {
+        break;
+      }
+
+      ++metadata.NumRequirements;
       bool needsWitnessTable =
         Lowering::TypeConverter::protocolRequiresWitnessTable(protocol);
       auto flags = GenericRequirementFlags(GenericRequirementKind::Protocol,
@@ -5247,6 +5292,7 @@ GenericRequirementsMetadata irgen::addGenericRequirements(
 
     case RequirementKind::SameType:
     case RequirementKind::Superclass: {
+      ++metadata.NumRequirements;
       auto abiKind = kind == RequirementKind::SameType
         ? GenericRequirementKind::SameType
         : GenericRequirementKind::BaseClass;
@@ -5351,14 +5397,14 @@ bool irgen::methodRequiresReifiedVTableEntry(IRGenModule &IGM,
 }
 
 llvm::GlobalValue *irgen::emitAsyncFunctionPointer(IRGenModule &IGM,
-                                                   SILFunction *function,
+                                                   llvm::Function *function,
+                                                   LinkEntity entity,
                                                    Size size) {
   ConstantInitBuilder initBuilder(IGM);
   ConstantStructBuilder builder(
       initBuilder.beginStruct(IGM.AsyncFunctionPointerTy));
-  builder.addRelativeAddress(
-      IGM.getAddrOfSILFunction(function, NotForDefinition));
+  builder.addRelativeAddress(function);
   builder.addInt32(size.getValue());
   return cast<llvm::GlobalValue>(IGM.defineAsyncFunctionPointer(
-      function, builder.finishAndCreateFuture()));
+      entity, builder.finishAndCreateFuture()));
 }

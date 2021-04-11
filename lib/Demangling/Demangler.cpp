@@ -123,6 +123,8 @@ bool swift::Demangle::isFunctionAttr(Node::Kind kind) {
     case Node::Kind::DynamicallyReplaceableFunctionKey:
     case Node::Kind::DynamicallyReplaceableFunctionVar:
     case Node::Kind::AsyncFunctionPointer:
+    case Node::Kind::AsyncAwaitResumePartialFunction:
+    case Node::Kind::AsyncSuspendResumePartialFunction:
       return true;
     default:
       return false;
@@ -728,6 +730,22 @@ NodePointer Demangler::demangleSymbolicReference(unsigned char rawKind) {
   return resolved;
 }
 
+NodePointer Demangler::demangleTypeAnnotation() {
+  switch (char c2 = nextChar()) {
+  case 'a':
+    return createNode(Node::Kind::AsyncAnnotation);
+  case 'b':
+    return createNode(Node::Kind::ConcurrentFunctionType);
+  case 'j':
+    return demangleDifferentiableFunctionType();
+  case 'k':
+    return createType(
+        createWithChild(Node::Kind::NoDerivative, popTypeAndGetChild()));
+  default:
+    return nullptr;
+  }
+}
+
 NodePointer Demangler::demangleOperator() {
 recur:
   switch (unsigned char c = nextChar()) {
@@ -779,7 +797,7 @@ recur:
     case 'V': return demangleAnyGenericType(Node::Kind::Structure);
     case 'W': return demangleWitness();
     case 'X': return demangleSpecialType();
-    case 'Y': return createNode(Node::Kind::AsyncAnnotation);
+    case 'Y': return demangleTypeAnnotation();
     case 'Z': return createWithChild(Node::Kind::Static, popNode(isEntity));
     case 'a': return demangleAnyGenericType(Node::Kind::TypeAlias);
     case 'c': return popFunctionType(Node::Kind::FunctionType);
@@ -1128,6 +1146,10 @@ NodePointer Demangler::demangleBuiltinType() {
       Ty = createNode(Node::Kind::BuiltinTypeName,
                               BUILTIN_TYPE_NAME_UNSAFEVALUEBUFFER);
       break;
+    case 'e':
+      Ty = createNode(Node::Kind::BuiltinTypeName,
+                              BUILTIN_TYPE_NAME_EXECUTOR);
+      break;
     case 'f': {
       int size = demangleIndex() - 1;
       if (size <= 0 || size > maxTypeSize)
@@ -1250,7 +1272,9 @@ NodePointer Demangler::popFunctionType(Node::Kind kind, bool hasClangType) {
     ClangType = demangleClangType();
   }
   addChild(FuncType, ClangType);
+  addChild(FuncType, popNode(Node::Kind::DifferentiableFunctionType));
   addChild(FuncType, popNode(Node::Kind::ThrowsAnnotation));
+  addChild(FuncType, popNode(Node::Kind::ConcurrentFunctionType));
   addChild(FuncType, popNode(Node::Kind::AsyncAnnotation));
 
   FuncType = addChild(FuncType, popFunctionParams(Node::Kind::ArgumentTuple));
@@ -1285,7 +1309,13 @@ NodePointer Demangler::popFunctionParamLabels(NodePointer Type) {
 
   unsigned FirstChildIdx = 0;
   if (FuncType->getChild(FirstChildIdx)->getKind()
+        == Node::Kind::DifferentiableFunctionType)
+    ++FirstChildIdx;
+  if (FuncType->getChild(FirstChildIdx)->getKind()
         == Node::Kind::ThrowsAnnotation)
+    ++FirstChildIdx;
+  if (FuncType->getChild(FirstChildIdx)->getKind()
+        == Node::Kind::ConcurrentFunctionType)
     ++FirstChildIdx;
   if (FuncType->getChild(FirstChildIdx)->getKind()
         == Node::Kind::AsyncAnnotation)
@@ -1609,6 +1639,7 @@ bool Demangle::nodeConsumesGenericArgs(Node *node) {
     case Node::Kind::DefaultArgumentInitializer:
     case Node::Kind::Initializer:
     case Node::Kind::PropertyWrapperBackingInitializer:
+    case Node::Kind::PropertyWrapperInitFromProjectedValue:
       return false;
     default:
       return true;
@@ -1760,12 +1791,12 @@ NodePointer Demangler::demangleImplResultConvention(Node::Kind ConvKind) {
                          createNode(Node::Kind::ImplConvention, attr));
 }
 
-NodePointer Demangler::demangleImplDifferentiability() {
+NodePointer Demangler::demangleImplParameterResultDifferentiability() {
   // Empty string represents default differentiability.
   const char *attr = "";
   if (nextIf('w'))
     attr = "@noDerivative";
-  return createNode(Node::Kind::ImplDifferentiability, attr);
+  return createNode(Node::Kind::ImplParameterResultDifferentiability, attr);
 }
 
 NodePointer Demangler::demangleClangType() {
@@ -1821,10 +1852,19 @@ NodePointer Demangler::demangleImplFunctionType() {
   if (nextIf('e'))
     type->addChild(createNode(Node::Kind::ImplEscaping), *this);
 
-  if (nextIf('d'))
-    type->addChild(createNode(Node::Kind::ImplDifferentiable), *this);
-  if (nextIf('l'))
-    type->addChild(createNode(Node::Kind::ImplLinear), *this);
+  switch ((MangledDifferentiabilityKind)peekChar()) {
+  case MangledDifferentiabilityKind::Normal:  // 'd'
+  case MangledDifferentiabilityKind::Linear:  // 'l'
+  case MangledDifferentiabilityKind::Forward: // 'f'
+  case MangledDifferentiabilityKind::Reverse: // 'r'
+    type->addChild(
+        createNode(
+            Node::Kind::ImplDifferentiabilityKind, (Node::IndexType)nextChar()),
+        *this);
+    break;
+  default:
+    break;
+  }
 
   const char *CAttr = nullptr;
   switch (nextChar()) {
@@ -1872,6 +1912,11 @@ NodePointer Demangler::demangleImplFunctionType() {
   if (CoroAttr)
     type->addChild(createNode(Node::Kind::ImplFunctionAttribute, CoroAttr), *this);
 
+  if (nextIf('h')) {
+    type->addChild(createNode(Node::Kind::ImplFunctionAttribute, "@Sendable"),
+                   *this);
+  }
+
   if (nextIf('H')) {
     type->addChild(createNode(Node::Kind::ImplFunctionAttribute, "@async"),
                    *this);
@@ -1883,14 +1928,14 @@ NodePointer Demangler::demangleImplFunctionType() {
   while (NodePointer Param =
              demangleImplParamConvention(Node::Kind::ImplParameter)) {
     type = addChild(type, Param);
-    if (NodePointer Diff = demangleImplDifferentiability())
+    if (NodePointer Diff = demangleImplParameterResultDifferentiability())
       Param = addChild(Param, Diff);
     ++NumTypesToAdd;
   }
   while (NodePointer Result = demangleImplResultConvention(
                                                     Node::Kind::ImplResult)) {
     type = addChild(type, Result);
-    if (NodePointer Diff = demangleImplDifferentiability())
+    if (NodePointer Diff = demangleImplParameterResultDifferentiability())
       Result = addChild(Result, Diff);
     ++NumTypesToAdd;
   }
@@ -2276,18 +2321,31 @@ NodePointer Demangler::demangleThunkOrSpecialization() {
     case 'X': return createNode(Node::Kind::DynamicallyReplaceableFunctionVar);
     case 'x': return createNode(Node::Kind::DynamicallyReplaceableFunctionKey);
     case 'I': return createNode(Node::Kind::DynamicallyReplaceableFunctionImpl);
+    case 'Y':
+    case 'Q': {
+      NodePointer discriminator = demangleIndexAsNode();
+      return createWithChild(
+          c == 'Q' ? Node::Kind::AsyncAwaitResumePartialFunction :
+             /*'Y'*/ Node::Kind::AsyncSuspendResumePartialFunction,
+          discriminator);
+    }
     case 'C': {
       NodePointer type = popNode(Node::Kind::Type);
       return createWithChild(Node::Kind::CoroutineContinuationPrototype, type);
     }
     case 'z':
     case 'Z': {
+      NodePointer flagMode = demangleIndexAsNode();
+      NodePointer sig = popNode(Node::Kind::DependentGenericSignature);
       NodePointer resultType = popNode(Node::Kind::Type);
       NodePointer implType = popNode(Node::Kind::Type);
-      return createWithChildren(c == 'z'
+      auto node = createWithChildren(c == 'z'
                                   ? Node::Kind::ObjCAsyncCompletionHandlerImpl
                                   : Node::Kind::PredefinedObjCAsyncCompletionHandlerImpl,
-                                implType, resultType);
+                                implType, resultType, flagMode);
+      if (sig)
+        addChild(node, sig);
+      return node;
     }
     case 'V': {
       NodePointer Base = popNode(isEntity);
@@ -2479,25 +2537,42 @@ NodePointer Demangler::demangleThunkOrSpecialization() {
       return createNode(Node::Kind::OutlinedBridgedMethod, Params);
     }
     case 'u': return createNode(Node::Kind::AsyncFunctionPointer);
-    case 'J': {
-      auto result = createNode(Node::Kind::AutoDiffFunction);
-      auto optionalGenSig = popNode(Node::Kind::DependentGenericSignature);
-      auto original = popNode();
-      result = addChild(result, original);
-      addChild(result, optionalGenSig);
-      auto kind = demangleAutoDiffFunctionKind();
-      if (!kind)
-        return nullptr;
-      result = addChild(result, kind);
-      result = addChild(result, demangleIndexSubset());
-      if (!nextIf('p')) return nullptr;
-      result = addChild(result, demangleIndexSubset());
-      if (!nextIf('r')) return nullptr;
-      return result;
-    }
+    case 'J':
+      switch (peekChar()) {
+      case 'S':
+        nextChar();
+        return demangleAutoDiffSubsetParametersThunk();
+      case 'O':
+        nextChar();
+        return demangleAutoDiffSelfReorderingReabstractionThunk();
+      case 'V':
+        nextChar();
+        return demangleAutoDiffFunctionOrSimpleThunk(
+            Node::Kind::AutoDiffDerivativeVTableThunk);
+      default:
+        return demangleAutoDiffFunctionOrSimpleThunk(
+            Node::Kind::AutoDiffFunction);
+      }
     default:
       return nullptr;
   }
+}
+
+NodePointer
+Demangler::demangleAutoDiffFunctionOrSimpleThunk(Node::Kind nodeKind) {
+  auto result = createNode(nodeKind);
+  while (auto *originalNode = popNode())
+    result = addChild(result, originalNode);
+  result->reverseChildren();
+  auto kind = demangleAutoDiffFunctionKind();
+  result = addChild(result, kind);
+  result = addChild(result, demangleIndexSubset());
+  if (!nextIf('p'))
+    return nullptr;
+  result = addChild(result, demangleIndexSubset());
+  if (!nextIf('r'))
+    return nullptr;
+  return result;
 }
 
 NodePointer Demangler::demangleAutoDiffFunctionKind() {
@@ -2505,6 +2580,62 @@ NodePointer Demangler::demangleAutoDiffFunctionKind() {
   if (kind != 'f' && kind != 'r' && kind != 'd' && kind != 'p')
     return nullptr;
   return createNode(Node::Kind::AutoDiffFunctionKind, kind);
+}
+
+NodePointer Demangler::demangleAutoDiffSubsetParametersThunk() {
+  auto result = createNode(Node::Kind::AutoDiffSubsetParametersThunk);
+  while (auto *node = popNode())
+    result = addChild(result, node);
+  result->reverseChildren();
+  auto kind = demangleAutoDiffFunctionKind();
+  result = addChild(result, kind);
+  result = addChild(result, demangleIndexSubset());
+  if (!nextIf('p'))
+    return nullptr;
+  result = addChild(result, demangleIndexSubset());
+  if (!nextIf('r'))
+    return nullptr;
+  result = addChild(result, demangleIndexSubset());
+  if (!nextIf('P'))
+    return nullptr;
+  return result;
+}
+
+NodePointer Demangler::demangleAutoDiffSelfReorderingReabstractionThunk() {
+  auto result = createNode(
+      Node::Kind::AutoDiffSelfReorderingReabstractionThunk);
+  addChild(result, popNode(Node::Kind::DependentGenericSignature));
+  result = addChild(result, popNode(Node::Kind::Type));
+  result = addChild(result, popNode(Node::Kind::Type));
+  result->reverseChildren();
+  result = addChild(result, demangleAutoDiffFunctionKind());
+  return result;
+}
+
+NodePointer Demangler::demangleDifferentiabilityWitness() {
+  auto result = createNode(Node::Kind::DifferentiabilityWitness);
+  auto optionalGenSig = popNode(Node::Kind::DependentGenericSignature);
+  while (auto *node = popNode())
+    result = addChild(result, node);
+  result->reverseChildren();
+  MangledDifferentiabilityKind kind;
+  switch (auto c = nextChar()) {
+  case 'f': kind = MangledDifferentiabilityKind::Forward; break;
+  case 'r': kind = MangledDifferentiabilityKind::Reverse; break;
+  case 'd': kind = MangledDifferentiabilityKind::Normal; break;
+  case 'l': kind = MangledDifferentiabilityKind::Linear; break;
+  default: return nullptr;
+  }
+  result = addChild(
+      result, createNode(Node::Kind::Index, (Node::IndexType)kind));
+  result = addChild(result, demangleIndexSubset());
+  if (!nextIf('p'))
+    return nullptr;
+  result = addChild(result, demangleIndexSubset());
+  if (!nextIf('r'))
+    return nullptr;
+  addChild(result, optionalGenSig);
+  return result;
 }
 
 NodePointer Demangler::demangleIndexSubset() {
@@ -2516,6 +2647,19 @@ NodePointer Demangler::demangleIndexSubset() {
   if (str.empty())
     return nullptr;
   return createNode(Node::Kind::IndexSubset, str);
+}
+
+NodePointer Demangler::demangleDifferentiableFunctionType() {
+  MangledDifferentiabilityKind kind;
+  switch (auto c = nextChar()) {
+  case 'f': kind = MangledDifferentiabilityKind::Forward; break;
+  case 'r': kind = MangledDifferentiabilityKind::Reverse; break;
+  case 'd': kind = MangledDifferentiabilityKind::Normal; break;
+  case 'l': kind = MangledDifferentiabilityKind::Linear; break;
+  default: return nullptr;
+  }
+  return createNode(
+      Node::Kind::DifferentiableFunctionType, (Node::IndexType)kind);
 }
 
 std::string Demangler::demangleBridgedMethodParams() {
@@ -2936,6 +3080,8 @@ NodePointer Demangler::demangleWitness() {
                                 context,
                                 declList);
     }
+    case 'J':
+      return demangleDifferentiabilityWitness();
     default:
       return nullptr;
   }
@@ -2968,14 +3114,6 @@ NodePointer Demangler::demangleSpecialType() {
       default:
         return nullptr;
       }
-    case 'F':
-      return popFunctionType(Node::Kind::DifferentiableFunctionType);
-    case 'G':
-      return popFunctionType(Node::Kind::EscapingDifferentiableFunctionType);
-    case 'H':
-      return popFunctionType(Node::Kind::LinearFunctionType);
-    case 'I':
-      return popFunctionType(Node::Kind::EscapingLinearFunctionType);
     case 'o':
       return createType(createWithChild(Node::Kind::Unowned,
                                         popNode(Node::Kind::Type)));
@@ -3175,6 +3313,10 @@ NodePointer Demangler::demangleFunctionEntity() {
     case 'P':
       Args = None;
       Kind = Node::Kind::PropertyWrapperBackingInitializer;
+      break;
+    case 'W':
+      Args = None;
+      Kind = Node::Kind::PropertyWrapperInitFromProjectedValue;
       break;
     default: return nullptr;
   }

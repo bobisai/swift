@@ -371,6 +371,12 @@ struct PrintOptions {
   /// Whether to print the extensions from conforming protocols.
   bool PrintExtensionFromConformingProtocols = false;
 
+  /// Whether to always try and print parameter labels. If present, print the
+  /// external parameter name. Otherwise try printing the internal name as
+  /// `_ <internalName>`, if an internal name exists. If neither an external nor
+  /// an internal name exists, only print the parameter's type.
+  bool AlwaysTryPrintParameterLabels = false;
+
   std::shared_ptr<ShouldPrintChecker> CurrentPrintabilityChecker =
     std::make_shared<ShouldPrintChecker>();
 
@@ -460,6 +466,10 @@ struct PrintOptions {
   /// Whether to print inheritance lists for types.
   bool PrintInherited = true;
 
+  /// Whether to print feature checks for compatibility with older Swift
+  /// compilers that might parse the result.
+  bool PrintCompatibilityFeatureChecks = false;
+
   /// \see ShouldQualifyNestedDeclarations
   enum class QualifyNestedDeclarations {
     Never,
@@ -504,7 +514,8 @@ struct PrintOptions {
   }
 
   /// Retrieve the set of options suitable for diagnostics printing.
-  static PrintOptions printForDiagnostics(AccessLevel accessFilter) {
+  static PrintOptions printForDiagnostics(AccessLevel accessFilter,
+                                          bool printFullConvention) {
     PrintOptions result = printVerbose();
     result.PrintAccess = true;
     result.Indent = 4;
@@ -523,12 +534,16 @@ struct PrintOptions {
         QualifyNestedDeclarations::TypesOnly;
     result.PrintDocumentationComments = false;
     result.PrintCurrentMembersOnly = true;
+    if (printFullConvention)
+      result.PrintFunctionRepresentationAttrs =
+          PrintOptions::FunctionRepresentationMode::Full;
     return result;
   }
 
   /// Retrieve the set of options suitable for interface generation.
-  static PrintOptions printInterface() {
-    PrintOptions result = printForDiagnostics(AccessLevel::Public);
+  static PrintOptions printInterface(bool printFullConvention) {
+    PrintOptions result =
+        printForDiagnostics(AccessLevel::Public, printFullConvention);
     result.SkipUnavailable = true;
     result.SkipImplicit = true;
     result.SkipSwiftPrivateClangDecls = true;
@@ -565,8 +580,8 @@ struct PrintOptions {
   /// Retrieve the set of options suitable for "Generated Interfaces", which
   /// are a prettified representation of the public API of a module, to be
   /// displayed to users in an editor.
-  static PrintOptions printModuleInterface();
-  static PrintOptions printTypeInterface(Type T);
+  static PrintOptions printModuleInterface(bool printFullConvention);
+  static PrintOptions printTypeInterface(Type T, bool printFullConvention);
 
   void setBaseType(Type T);
 
@@ -582,16 +597,16 @@ struct PrintOptions {
   }
 
   /// Retrieve the print options that are suitable to print the testable interface.
-  static PrintOptions printTestableInterface() {
-    PrintOptions result = printInterface();
+  static PrintOptions printTestableInterface(bool printFullConvention) {
+    PrintOptions result = printInterface(printFullConvention);
     result.AccessFilter = AccessLevel::Internal;
     return result;
   }
 
   /// Retrieve the print options that are suitable to print interface for a
   /// swift file.
-  static PrintOptions printSwiftFileInterface() {
-    PrintOptions result = printInterface();
+  static PrintOptions printSwiftFileInterface(bool printFullConvention) {
+    PrintOptions result = printInterface(printFullConvention);
     result.AccessFilter = AccessLevel::Internal;
     result.EmptyLineBetweenMembers = true;
     return result;

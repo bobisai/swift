@@ -1,16 +1,13 @@
-// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-concurrency  %import-libdispatch)
+// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-concurrency  %import-libdispatch -parse-as-library)
 
 // REQUIRES: executable_test
 // REQUIRES: concurrency
 // REQUIRES: libdispatch
 
-import Dispatch
+// rdar://76038845
+// UNSUPPORTED: use_os_stdlib
 
-#if canImport(Darwin)
-import Darwin
-#elseif canImport(Glibc)
-import Glibc
-#endif
+import Dispatch
 
 func fib(_ n: Int) -> Int {
     var first = 0
@@ -23,39 +20,43 @@ func fib(_ n: Int) -> Int {
     return first
 }
 
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
 func asyncFib(_ n: Int) async -> Int {
   if n == 0 || n == 1 {
     return n
   }
 
-  let first = Task.runDetached {
+  let first = detach {
     await asyncFib(n - 2)
   }
 
-  let second = Task.runDetached {
+  let second = detach {
     await asyncFib(n - 1)
   }
 
   // Sleep a random amount of time waiting on the result producing a result.
-  usleep(UInt32.random(in: 0..<100) * 1000)
+  await Task.sleep(UInt64.random(in: 0..<100) * 1_000_000)
 
   let result = try! await first.get() + second.get()
 
   // Sleep a random amount of time before producing a result.
-  usleep(UInt32.random(in: 0..<100) * 1000)
+  await Task.sleep(UInt64.random(in: 0..<100) * 1_000_000)
 
   return result
 }
 
-func runFibonacci(_ n: Int) {
-  var result = 0
-  runAsyncAndBlock {
-    result = await asyncFib(n)
-  }
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
+func runFibonacci(_ n: Int) async {
+  var result = await asyncFib(n)
 
   print()
   print("Async fib = \(result), sequential fib = \(fib(n))")
   assert(result == fib(n))
 }
 
-runFibonacci(15)
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
+@main struct Main {
+  static func main() async {
+    await runFibonacci(15)
+  }
+}

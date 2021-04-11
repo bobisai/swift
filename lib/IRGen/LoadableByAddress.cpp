@@ -2287,7 +2287,7 @@ static void rewriteFunction(StructLoweringState &pass,
   while (!pass.modReturnInsts.empty()) {
     auto *instr = pass.modReturnInsts.pop_back_val();
     auto loc = instr->getLoc(); // SILLocation::RegularKind
-    auto regLoc = RegularLocation(loc.getSourceLoc());
+    auto regLoc = RegularLocation(loc);
     SILBuilderWithScope retBuilder(instr);
     assert(modNonFuncTypeResultType(pass.F, pass.Mod) &&
            "Expected a regular type");
@@ -2530,7 +2530,8 @@ void LoadableByAddress::recreateSingleApply(
     SILValue newApply =
       applyBuilder.createApply(castedApply->getLoc(), callee,
                                applySite.getSubstitutionMap(),
-                               callArgs, castedApply->isNonThrowing());
+                               callArgs,
+                               castedApply->getApplyOptions());
     castedApply->replaceAllUsesWith(newApply);
     break;
   }
@@ -2539,7 +2540,8 @@ void LoadableByAddress::recreateSingleApply(
     applyBuilder.createTryApply(
         castedApply->getLoc(), callee,
         applySite.getSubstitutionMap(), callArgs,
-        castedApply->getNormalBB(), castedApply->getErrorBB());
+        castedApply->getNormalBB(), castedApply->getErrorBB(),
+        castedApply->getApplyOptions());
     break;
   }
   case SILInstructionKind::BeginApplyInst: {
@@ -2547,7 +2549,7 @@ void LoadableByAddress::recreateSingleApply(
     auto newApply =
       applyBuilder.createBeginApply(oldApply->getLoc(), callee,
                                     applySite.getSubstitutionMap(), callArgs,
-                                    oldApply->isNonThrowing());
+                                    oldApply->getApplyOptions());
 
     // Use the new token result.
     oldApply->getTokenResult()->replaceAllUsesWith(newApply->getTokenResult());

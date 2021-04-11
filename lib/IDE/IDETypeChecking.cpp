@@ -58,14 +58,15 @@ class ModulePrinterPrintableChecker: public ShouldPrintChecker {
   }
 };
 
-PrintOptions PrintOptions::printModuleInterface() {
-  PrintOptions result = printInterface();
+PrintOptions PrintOptions::printModuleInterface(bool printFullConvention) {
+  PrintOptions result = printInterface(printFullConvention);
   result.CurrentPrintabilityChecker.reset(new ModulePrinterPrintableChecker());
   return result;
 }
 
-PrintOptions PrintOptions::printTypeInterface(Type T) {
-  PrintOptions result = printModuleInterface();
+PrintOptions PrintOptions::printTypeInterface(Type T,
+                                              bool printFullConvention) {
+  PrintOptions result = printModuleInterface(printFullConvention);
   result.PrintExtensionFromConformingProtocols = true;
   result.TransformContext = TypeTransformContext(T);
   result.printExtensionContentAsMembers = [T](const ExtensionDecl *ED) {
@@ -77,7 +78,8 @@ PrintOptions PrintOptions::printTypeInterface(Type T) {
 }
 
 PrintOptions PrintOptions::printDocInterface() {
-  PrintOptions result = PrintOptions::printModuleInterface();
+  PrintOptions result =
+      PrintOptions::printModuleInterface(/*printFullConvention*/ false);
   result.PrintAccess = false;
   result.SkipUnavailable = false;
   result.ExcludeAttrList.push_back(DAK_Available);
@@ -262,7 +264,7 @@ struct SynthesizedExtensionAnalyzer::Implementation {
                ExtensionDecl *EnablingExt, NormalProtocolConformance *Conf) {
     SynthesizedExtensionInfo Result(IsSynthesized, EnablingExt);
     ExtensionMergeInfo MergeInfo;
-    MergeInfo.Unmergable = !Ext->getRawComment().isEmpty() || // With comments
+    MergeInfo.Unmergable = !Ext->getRawComment(/*SerializedOK=*/false).isEmpty() || // With comments
                            Ext->getAttrs().hasAttribute<AvailableAttr>(); // With @available
     MergeInfo.InheritsCount = countInherits(Ext);
 

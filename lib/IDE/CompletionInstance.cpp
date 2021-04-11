@@ -199,7 +199,7 @@ forEachDependencyUntilTrue(CompilerInstance &CI, unsigned excludeBufferID,
     if (callback(dep))
       return true;
   }
-  for (auto &dep : CI.getDependencyTracker()->getIncrementalDependencies()) {
+  for (auto dep : CI.getDependencyTracker()->getIncrementalDependencyPaths()) {
     if (callback(dep))
       return true;
   }
@@ -288,6 +288,10 @@ bool CompletionInstance::performCachedOperationIfPossible(
   llvm::PrettyStackTraceString trace(
       "While performing cached completion if possible");
 
+  // Check the invalidation first. Otherwise, in case no 'CacheCI' exists yet,
+  // the flag will remain 'true' even after 'CachedCI' is populated.
+  if (CachedCIShouldBeInvalidated.exchange(false))
+    return false;
   if (!CachedCI)
     return false;
   if (CachedReuseCount >= Opts.MaxASTReuseCount)
@@ -460,6 +464,7 @@ bool CompletionInstance::performCachedOperationIfPossible(
     auto &Ctx = oldM->getASTContext();
     auto *newM = ModuleDecl::createMainModule(Ctx, oldM->getName(),
                                               oldM->getImplicitImportInfo());
+    newM->setABIName(oldM->getABIName());
     auto *newSF = new (Ctx) SourceFile(*newM, SourceFileKind::Main, newBufferID,
                                        oldSF->getParsingOptions());
     newM->addFile(*newSF);
@@ -584,6 +589,10 @@ bool CompletionInstance::shouldCheckDependencies() const {
   auto threshold = DependencyCheckedTimestamp +
                    seconds(Opts.DependencyCheckIntervalSecond);
   return threshold <= now;
+}
+
+void CompletionInstance::markCachedCompilerInstanceShouldBeInvalidated() {
+  CachedCIShouldBeInvalidated = true;
 }
 
 void CompletionInstance::setOptions(CompletionInstance::Options NewOpts) {

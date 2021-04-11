@@ -497,3 +497,6 @@ extension ClosedRange: Encodable where Bound: Encodable {
     try container.encode(self.upperBound)
   }
 }
+
+extension ClosedRange: Sendable where Bound: Sendable { }
+extension ClosedRange.Index: Sendable where Bound: Sendable { }

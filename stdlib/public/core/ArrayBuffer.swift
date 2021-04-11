@@ -672,4 +672,7 @@ extension _ArrayBuffer {
     }
   }
 }
+
+extension _ArrayBuffer: Sendable, UnsafeSendable
+  where Element: Sendable { }
 #endif

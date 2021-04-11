@@ -11,7 +11,9 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-combine"
+
 #include "SILCombiner.h"
+
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/DynamicCasts.h"
 #include "swift/SIL/PatternMatch.h"
@@ -23,6 +25,7 @@
 #include "swift/SILOptimizer/Utils/CFGOptUtils.h"
 #include "swift/SILOptimizer/Utils/DebugOptUtils.h"
 #include "swift/SILOptimizer/Utils/InstOptUtils.h"
+#include "swift/SILOptimizer/Utils/OwnershipOptUtils.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -141,7 +144,7 @@ public:
     if (!hasOneNonDebugUse(next))
       return false;
 
-    assert(getSingleNonDebugUser(rest.back()) == next);
+    assert(rest.empty() || getSingleNonDebugUser(rest.back()) == next);
     rest.push_back(next);
     return true;
   }
@@ -232,10 +235,18 @@ visitPointerToAddressInst(PointerToAddressInst *PTAI) {
   if (PTAI->isStrict()) {
     // We can not perform this optimization with ownership until we are able to
     // handle issues around interior pointers and expanding borrow scopes.
-    if (!F->hasOwnership()) {
-      if (auto *ATPI = dyn_cast<AddressToPointerInst>(PTAI->getOperand())) {
+    if (auto *ATPI = dyn_cast<AddressToPointerInst>(PTAI->getOperand())) {
+      if (!hasOwnership()) {
         return Builder.createUncheckedAddrCast(PTAI->getLoc(), ATPI->getOperand(),
                                                PTAI->getType());
+      }
+
+      OwnershipRAUWHelper helper(ownershipFixupContext, PTAI, ATPI->getOperand());
+      if (helper) {
+        auto *newInst = Builder.createUncheckedAddrCast(PTAI->getLoc(), ATPI->getOperand(),
+                                                        PTAI->getType());
+        helper.perform(newInst);
+        return nullptr;
       }
     }
   }
@@ -460,7 +471,7 @@ SILCombiner::visitUncheckedRefCastInst(UncheckedRefCastInst *urci) {
   // can remove both the open_existential_ref and the init_existential_ref.
   if (auto *oer = dyn_cast<OpenExistentialRefInst>(urci->getOperand())) {
     if (auto *ier = dyn_cast<InitExistentialRefInst>(oer->getOperand())) {
-      if (ier->getOwnershipKind() != OwnershipKind::Owned) {
+      if (ier->getForwardingOwnershipKind() != OwnershipKind::Owned) {
         return Builder.createUncheckedRefCast(urci->getLoc(), ier->getOperand(),
                                               urci->getType());
       }
@@ -569,8 +580,14 @@ static bool canBeUsedAsCastDestination(SILValue value, CastInst *castInst,
 
 SILInstruction *SILCombiner::visitUnconditionalCheckedCastAddrInst(
     UnconditionalCheckedCastAddrInst *uccai) {
-  // Optimize the unconditional_checked_cast_addr in this pattern:
+
+  // Optimize the unconditional_checked_cast_addr in the following non-ossa/ossa
+  // pattern:
   //
+  // Non-OSSA Pattern
+  //
+  //   %value = ...
+  //   ...
   //   %box = alloc_existential_box $Error, $ConcreteError
   //   %a = project_existential_box $ConcreteError in %b : $Error
   //   store %value to %a : $*ConcreteError
@@ -581,33 +598,67 @@ SILInstruction *SILCombiner::visitUnconditionalCheckedCastAddrInst(
   //                                ConcreteError in %dest : $*ConcreteError
   //
   // to:
-  //   ...
+  //
   //   retain_value %value : $ConcreteError
+  //   ...
+  //   %box = alloc_existential_box $Error, $ConcreteError
+  //   %a = project_existential_box $ConcreteError in %b : $Error
+  //   store %value to %a : $*ConcreteError
+  //   %err = alloc_stack $Error
+  //   store %box to %err : $*Error
   //   destroy_addr %err : $*Error
   //   store %value to %dest $*ConcreteError
   //
-  // This lets the alloc_existential_box become dead and it can be removed in
-  // following optimizations.
+  // OSSA Pattern:
+  //
+  //   %value = ...
+  //   ...
+  //   %box = alloc_existential_box $Error, $ConcreteError
+  //   %a = project_existential_box $ConcreteError in %b : $Error
+  //   store %value to [init] %a : $*ConcreteError
+  //   %err = alloc_stack $Error
+  //   store %box to [init] %err : $*Error
+  //   %dest = alloc_stack $ConcreteError
+  //   unconditional_checked_cast_addr Error in %err : $*Error to
+  //                                ConcreteError in %dest : $*ConcreteError
+  //
+  // to:
+  //
+  //   %value_copy = copy_value %value
+  //   ...
+  //   %box = alloc_existential_box $Error, $ConcreteError
+  //   %a = project_existential_box $ConcreteError in %b : $Error
+  //   store %value to [init] %a : $*ConcreteError
+  //   %err = alloc_stack $Error
+  //   store %box to [init] %err : $*Error
+  //   destroy_addr %err : $*Error
+  //   store %value to %dest $*ConcreteError
+  //
+  // In both cases, this lets the alloc_existential_box become dead and it can
+  // be removed in other subsequent optimizations.
   SILValue val = getConcreteValueOfExistentialBoxAddr(uccai->getSrc(), uccai);
   while (auto *cvi = dyn_cast_or_null<CopyValueInst>(val))
     val = cvi->getOperand();
   if (canBeUsedAsCastDestination(val, uccai, DA)) {
     // We need to copy the value at its insertion point.
     {
-      auto *valInsertPt = val->getDefiningInsertionPoint();
-      if (!valInsertPt)
+      auto *nextInsertPt = val->getNextInstruction();
+      if (!nextInsertPt)
         return nullptr;
-      auto valInsertPtIter = valInsertPt->getIterator();
       // If our value is defined by an instruction (not an argument), we want to
       // insert the copy after that. Otherwise, we have an argument and we want
       // to insert the copy right at the beginning of the block.
-      if (val->getDefiningInstruction())
-        valInsertPtIter = std::next(valInsertPtIter);
-      SILBuilderWithScope builder(valInsertPtIter, Builder);
-      val = builder.emitCopyValueOperation(valInsertPtIter->getLoc(), val);
+      SILBuilderWithScope builder(nextInsertPt, Builder);
+      // We use an autogenerated location to ensure that if next is a
+      // terminator, we do not trip an assertion around mismatched debug info.
+      //
+      // FIXME: We should find a better way of solving this than losing location
+      // info!
+      auto loc = RegularLocation::getAutoGeneratedLocation();
+      val = builder.emitCopyValueOperation(loc, val);
     }
 
-    // Then we insert the destroy value/store at the cast location.
+    // Then we insert the destroy addr/store at the cast location.
     SILBuilderWithScope builder(uccai, Builder);
     SILLocation loc = uccai->getLoc();
     builder.createDestroyAddr(loc, uccai->getSrc());
@@ -652,45 +703,80 @@ visitUnconditionalCheckedCastInst(UnconditionalCheckedCastInst *UCCI) {
 }
 
 SILInstruction *
-SILCombiner::
-visitRawPointerToRefInst(RawPointerToRefInst *RawToRef) {
-  if (RawToRef->getFunction()->hasOwnership())
-    return nullptr;
-
+SILCombiner::visitRawPointerToRefInst(RawPointerToRefInst *rawToRef) {
   // (raw_pointer_to_ref (ref_to_raw_pointer x X->Y) Y->Z)
   //   ->
-  // (unchecked_ref_cast X->Z)
-  if (auto *RefToRaw = dyn_cast<RefToRawPointerInst>(RawToRef->getOperand())) {
-    return Builder.createUncheckedRefCast(RawToRef->getLoc(),
-                                          RefToRaw->getOperand(),
-                                          RawToRef->getType());
+  // (unchecked_ref_cast x X->Z)
+  if (auto *refToRaw = dyn_cast<RefToRawPointerInst>(rawToRef->getOperand())) {
+    if (!hasOwnership()) {
+      return Builder.createUncheckedRefCast(
+          rawToRef->getLoc(), refToRaw->getOperand(), rawToRef->getType());
+    }
+
+    // raw_pointer_to_ref produces an unowned value. So we need to handle it
+    // especially with ownership.
+    {
+      SILValue originalRef = refToRaw->getOperand();
+      OwnershipRAUWHelper helper(ownershipFixupContext, rawToRef, originalRef);
+      if (helper) {
+        // We use the refToRaw's insertion point to insert our
+        // unchecked_ref_cast, since we don't know if our guaranteed value
+        SILBuilderWithScope localBuilder(std::next(refToRaw->getIterator()),
+                                         Builder);
+        // Since we are using std::next, we use getAutogeneratedLocation to
+        // avoid any issues if our next insertion point is a terminator.
+        auto loc = RegularLocation::getAutoGeneratedLocation();
+        auto *newInst = localBuilder.createUncheckedRefCast(
+            loc, originalRef, rawToRef->getType());
+        // If we have an operand with ownership, we need to change our
+        // unchecked_ref_cast to produce an unowned value. This is because
+        // otherwise, our unchecked_ref_cast will consume the underlying owned
+        // value, changing a BitwiseEscape to a LifetimeEnding use?! In
+        // contrast, for guaranteed, we are replacing a BitwiseEscape use
+        // (ref_to_rawpointer) with a ForwardedBorrowingUse (unchecked_ref_cast)
+        // which is safe.
+        if (newInst->getForwardingOwnershipKind() == OwnershipKind::Owned) {
+          newInst->setForwardingOwnershipKind(OwnershipKind::Unowned);
+        }
+        helper.perform(newInst);
+        return nullptr;
+      }
+    }
   }
 
   return nullptr;
 }
 
-SILInstruction *
-SILCombiner::
-visitUncheckedTrivialBitCastInst(UncheckedTrivialBitCastInst *UTBCI) {
+SILInstruction *SILCombiner::visitUncheckedTrivialBitCastInst(
+    UncheckedTrivialBitCastInst *utbci) {
   // (unchecked_trivial_bit_cast Y->Z
   //                                 (unchecked_trivial_bit_cast X->Y x))
   //   ->
   // (unchecked_trivial_bit_cast X->Z x)
-  SILValue Op = UTBCI->getOperand();
-  if (auto *OtherUTBCI = dyn_cast<UncheckedTrivialBitCastInst>(Op)) {
-    return Builder.createUncheckedTrivialBitCast(UTBCI->getLoc(),
-                                                 OtherUTBCI->getOperand(),
-                                                 UTBCI->getType());
+  SILValue operand = utbci->getOperand();
+  if (auto *otherUTBCI = dyn_cast<UncheckedTrivialBitCastInst>(operand)) {
+    return Builder.createUncheckedTrivialBitCast(
+        utbci->getLoc(), otherUTBCI->getOperand(), utbci->getType());
   }
 
-  // (unchecked_trivial_bit_cast Y->Z
-  //                                 (unchecked_ref_cast X->Y x))
+  // %y = unchecked_ref_cast %x X->Y
+  // ...
+  // %z = unchecked_trivial_bit_cast %y Y->Z
+  //
   //   ->
-  // (unchecked_trivial_bit_cast X->Z x)
-  if (auto *URBCI = dyn_cast<UncheckedRefCastInst>(Op)) {
-    return Builder.createUncheckedTrivialBitCast(UTBCI->getLoc(),
-                                                 URBCI->getOperand(),
-                                                 UTBCI->getType());
+  //
+  // %z = unchecked_trivial_bit_cast %x X->Z
+  // %y = unchecked_ref_cast %x X->Y
+  // ...
+  if (auto *urbci = dyn_cast<UncheckedRefCastInst>(operand)) {
+    // We just move the unchecked_trivial_bit_cast to before the
+    // unchecked_ref_cast and then make its operand the unchecked_ref_cast
+    // operand. Then we return the cast so we reprocess given that we changed
+    // its operands.
+    utbci->moveBefore(urbci);
+    utbci->setDebugLocation(urbci->getDebugLocation());
+    utbci->setOperand(urbci->getOperand());
+    return utbci;
   }
 
   return nullptr;
@@ -699,9 +785,6 @@ visitUncheckedTrivialBitCastInst(UncheckedTrivialBitCastInst *UTBCI) {
 SILInstruction *
 SILCombiner::
 visitUncheckedBitwiseCastInst(UncheckedBitwiseCastInst *UBCI) {
-  if (UBCI->getFunction()->hasOwnership())
-    return nullptr;
-
   // (unchecked_bitwise_cast Y->Z (unchecked_bitwise_cast X->Y x))
   // OR (unchecked_trivial_cast Y->Z (unchecked_bitwise_cast X->Y x))
   //   ->
@@ -710,27 +793,59 @@ visitUncheckedBitwiseCastInst(UncheckedBitwiseCastInst *UBCI) {
   if (match(UBCI->getOperand(),
             m_CombineOr(m_UncheckedBitwiseCastInst(m_SILValue(Oper)),
                         m_UncheckedTrivialBitCastInst(m_SILValue(Oper))))) {
-    return Builder.createUncheckedBitwiseCast(UBCI->getLoc(), Oper,
-                                              UBCI->getType());
+    if (!Builder.hasOwnership()) {
+      return Builder.createUncheckedBitwiseCast(UBCI->getLoc(), Oper,
+                                                UBCI->getType());
+    }
+
+    OwnershipRAUWHelper helper(ownershipFixupContext, UBCI, Oper);
+    if (helper) {
+      auto *transformedOper = Builder.createUncheckedBitwiseCast(
+          UBCI->getLoc(), Oper, UBCI->getType());
+      helper.perform(transformedOper);
+      return nullptr;
+    }
   }
-  if (UBCI->getType().isTrivial(*UBCI->getFunction()))
-    return Builder.createUncheckedTrivialBitCast(UBCI->getLoc(),
-                                                 UBCI->getOperand(),
-                                                 UBCI->getType());
+
+  if (UBCI->getType().isTrivial(*UBCI->getFunction())) {
+    // If our result is trivial, we can always just RAUW.
+    return Builder.createUncheckedTrivialBitCast(
+        UBCI->getLoc(), UBCI->getOperand(), UBCI->getType());
+  }
 
   if (!SILType::canRefCast(UBCI->getOperand()->getType(), UBCI->getType(),
                            Builder.getModule()))
     return nullptr;
 
-  return Builder.createUncheckedRefCast(UBCI->getLoc(), UBCI->getOperand(),
-                                        UBCI->getType());
+  if (!Builder.hasOwnership()) {
+    return Builder.createUncheckedRefCast(UBCI->getLoc(), UBCI->getOperand(),
+                                          UBCI->getType());
+  }
+
+  {
+    OwnershipRAUWHelper helper(ownershipFixupContext, UBCI, UBCI->getOperand());
+    if (helper) {
+      auto *newInst = Builder.createUncheckedRefCast(UBCI->getLoc(), UBCI->getOperand(),
+                                                     UBCI->getType());
+      // If we have an operand with owned ownership, we change our
+      // unchecked_ref_cast to explicitly pass the owned operand as an unowned
+      // value. This is because otherwise, we would consume the owned value
+      // creating breaking OSSA. In contrast, if we have a guaranteed value, we
+      // are going to be replacing an UnownedInstantaneousUse with an
+      // InstantaneousUse which is always safe for a guaranteed value.
+      if (newInst->getForwardingOwnershipKind() == OwnershipKind::Owned) {
+        newInst->setForwardingOwnershipKind(OwnershipKind::Unowned);
+      }
+      helper.perform(newInst);
+      return nullptr;
+    }
+  }
+
+  return nullptr;
 }
 
 SILInstruction *
 SILCombiner::visitThickToObjCMetatypeInst(ThickToObjCMetatypeInst *TTOCMI) {
-  if (TTOCMI->getFunction()->hasOwnership())
-    return nullptr;
-
   if (auto *OCTTMI = dyn_cast<ObjCToThickMetatypeInst>(TTOCMI->getOperand())) {
     TTOCMI->replaceAllUsesWith(OCTTMI->getOperand());
     return eraseInstFromFunction(*TTOCMI);
@@ -753,9 +868,6 @@ SILCombiner::visitThickToObjCMetatypeInst(ThickToObjCMetatypeInst *TTOCMI) {
 
 SILInstruction *
 SILCombiner::visitObjCToThickMetatypeInst(ObjCToThickMetatypeInst *OCTTMI) {
-  if (OCTTMI->getFunction()->hasOwnership())
-    return nullptr;
-
   if (auto *TTOCMI = dyn_cast<ThickToObjCMetatypeInst>(OCTTMI->getOperand())) {
     OCTTMI->replaceAllUsesWith(TTOCMI->getOperand());
     return eraseInstFromFunction(*OCTTMI);
@@ -816,17 +928,12 @@ visitCheckedCastAddrBranchInst(CheckedCastAddrBranchInst *CCABI) {
     // We need to insert the copy after the defining instruction of val or at
     // the top of the block if val is an argument.
     {
-      auto *valInsertPt = val->getDefiningInsertionPoint();
-      if (!valInsertPt)
+      auto *nextInsertPt = val->getNextInstruction();
+      if (!nextInsertPt)
         return nullptr;
-      auto valInsertPtIter = valInsertPt->getIterator();
-      // If our value is defined by an instruction (not an argument), we want to
-      // insert the copy after that. Otherwise, we have an argument and we want
-      // to insert the copy right at the beginning of the block.
-      if (val->getDefiningInstruction())
-        valInsertPtIter = std::next(valInsertPtIter);
-      SILBuilderWithScope builder(valInsertPtIter, Builder);
-      val = builder.emitCopyValueOperation(valInsertPtIter->getLoc(), val);
+      SILBuilderWithScope builder(nextInsertPt, Builder);
+      auto loc = RegularLocation::getAutoGeneratedLocation();
+      val = builder.emitCopyValueOperation(loc, val);
     }
 
     SILBuilderWithScope builder(CCABI, Builder);
@@ -879,10 +986,8 @@ SILInstruction *SILCombiner::visitConvertEscapeToNoEscapeInst(
       SILType::getPrimitiveObjectType(NewTy));
 }
 
-SILInstruction *SILCombiner::visitConvertFunctionInst(ConvertFunctionInst *CFI) {
-  if (CFI->getFunction()->hasOwnership())
-    return nullptr;
-
+SILInstruction *
+SILCombiner::visitConvertFunctionInst(ConvertFunctionInst *cfi) {
   // If this conversion only changes substitutions, then rewrite applications
   // of the converted function as applications of the original.
   //
@@ -891,84 +996,122 @@ SILInstruction *SILCombiner::visitConvertFunctionInst(ConvertFunctionInst *CFI) 
   //
   // TODO: We could generalize this to handle other ABI-compatible cases, by
   // inserting the necessary casts around the arguments.
-  if (CFI->onlyConvertsSubstitutions()) {
-    auto usei = CFI->use_begin();
-    while (usei != CFI->use_end()) {
-      auto use = *usei++;
-      auto user = use->getUser();
-      if (isa<ApplySite>(user) && use->getOperandNumber() == 0) {
-        auto applySite = ApplySite(user);
-        // If this is a partial_apply, insert a convert_function back to the
-        // original result type.
+  if (cfi->onlyConvertsSubstitutions()) {
+    SmallVector<Operand *, 32> worklist(cfi->getUses());
+    while (!worklist.empty()) {
+      auto *use = worklist.pop_back_val();
+      auto *user = use->getUser();
 
-        if (auto pa = dyn_cast<PartialApplyInst>(user)) {
-          auto partialApplyTy = pa->getType();
-          Builder.setInsertionPoint(std::next(pa->getIterator()));
-          
-          SmallVector<SILValue, 4> args(pa->getArguments().begin(),
-                                        pa->getArguments().end());
-          
-          auto newPA = Builder.createPartialApply(pa->getLoc(),
-                                  CFI->getConverted(),
-                                  pa->getSubstitutionMap(),
-                                  args,
-                                  pa->getFunctionType()->getCalleeConvention());
-          auto newConvert = Builder.createConvertFunction(pa->getLoc(),
-                                                          newPA, partialApplyTy,
-                                                          false);
-          pa->replaceAllUsesWith(newConvert);
-          eraseInstFromFunction(*pa);
-          
-          continue;
-        }
-        
+      // Look through begin_borrow and copy_value.
+      if (isa<BeginBorrowInst>(user) || isa<CopyValueInst>(user)) {
+        for (auto result : user->getResults())
+          for (auto *resultUse : result->getUses())
+            worklist.push_back(resultUse);
+        continue;
+      }
+
+      if (!isa<ApplySite>(user) || use->getOperandNumber() != 0)
+        continue;
+
+      if (auto fas = FullApplySite::isa(user)) {
         // For full apply sites, we only need to replace the `convert_function`
         // with the original value.
-        use->set(CFI->getConverted());
-        applySite.setSubstCalleeType(
-                      CFI->getConverted()->getType().castTo<SILFunctionType>());
+        //
+        // OWNERSHIP DISCUSSION: We know that cfi is forwarding, so we know that
+        // if cfi is not owned, then we know that cfi->getConverted() must be
+        // valid at applySite and also that the applySite does not consume a
+        // value. In such a case, just perform the change and continue.
+        SILValue newValue = cfi->getConverted();
+        if (newValue.getOwnershipKind() != OwnershipKind::Owned &&
+            newValue.getOwnershipKind() != OwnershipKind::Guaranteed) {
+          instModCallbacks.setUseValue(use, newValue);
+          fas.setSubstCalleeType(newValue->getType().castTo<SILFunctionType>());
+          continue;
+        }
+
+        // Otherwise, we need to use the OwnershipReplaceSingleUseHelper since
+        // we have been looking through ownership forwarding insts and newValue
+        // may be a value with a different lifetime from our original value
+        // beyond the initial base value.
+        OwnershipReplaceSingleUseHelper helper(ownershipFixupContext, use,
+                                               newValue);
+        if (!helper)
+          continue;
+        helper.perform();
+        fas.setSubstCalleeType(newValue->getType().castTo<SILFunctionType>());
+        continue;
       }
+
+      // If this is a partial_apply, insert a convert_function back to the
+      // original result type.
+      auto *pa = dyn_cast<PartialApplyInst>(user);
+      if (!pa)
+        continue;
+
+      auto partialApplyTy = pa->getType();
+      if (!hasOwnership()) {
+        SILBuilderWithScope localBuilder(std::next(pa->getIterator()), Builder);
+        SmallVector<SILValue, 4> args(pa->getArguments().begin(),
+                                      pa->getArguments().end());
+
+        auto newPA = Builder.createPartialApply(
+            pa->getLoc(), cfi->getConverted(), pa->getSubstitutionMap(), args,
+            pa->getFunctionType()->getCalleeConvention());
+        auto newConvert = Builder.createConvertFunction(pa->getLoc(), newPA,
+                                                        partialApplyTy, false);
+        replaceInstUsesWith(*pa, newConvert);
+        eraseInstFromFunction(*pa);
+        continue;
+      }
+
+      OwnershipRAUWHelper helper(ownershipFixupContext, pa,
+                                 cfi->getConverted());
+      if (!helper)
+        continue;
+      SmallVector<SILValue, 4> args(pa->getArguments().begin(),
+                                    pa->getArguments().end());
+      auto newValue = makeCopiedValueAvailable(cfi->getConverted(),
+                                               pa->getParent());
+
+      SILBuilderWithScope localBuilder(std::next(pa->getIterator()), Builder);
+      auto *newPA = localBuilder.createPartialApply(
+          pa->getLoc(), newValue, pa->getSubstitutionMap(), args,
+          pa->getFunctionType()->getCalleeConvention());
+      if (!use->isLifetimeEnding()) {
+        localBuilder.emitDestroyValueOperation(pa->getLoc(), newValue);
+      }
+      auto *newConvert = localBuilder.createConvertFunction(
+          pa->getLoc(), newPA, partialApplyTy, false);
+      // We need to end the lifetime of the convert_function/partial_apply since
+      // the helper assumes that ossa is correct upon input.
+      localBuilder.emitDestroyValueOperation(pa->getLoc(), newConvert);
+      helper.perform(newConvert);
     }
   }
-  
+
   // (convert_function (convert_function x)) => (convert_function x)
-  if (auto subCFI = dyn_cast<ConvertFunctionInst>(CFI->getConverted())) {
-    // If we convert the function type back to itself, we can replace the
-    // conversion completely.
-    if (subCFI->getConverted()->getType() == CFI->getType()) {
-      CFI->replaceAllUsesWith(subCFI->getConverted());
-      eraseInstFromFunction(*CFI);
-      return nullptr;
+  if (auto *subCFI = dyn_cast<ConvertFunctionInst>(cfi->getConverted())) {
+    // We handle the case of an identity conversion in inst simplify, so if we
+    // see this pattern then we know that we don't have a round trip and thus
+    // should just bypass the intermediate conversion.
+    if (cfi->getForwardingOwnershipKind() != OwnershipKind::Owned) {
+      cfi->getOperandRef().set(subCFI->getConverted());
+      // Return cfi to show we changed it.
+      return cfi;
     }
-    
-    // Otherwise, we can still bypass the intermediate conversion.
-    CFI->getOperandRef().set(subCFI->getConverted());
+
+    // If we have an owned value, we can only perform this optimization if the
+    // convert_function is in the same block to ensure that we know we will
+    // eliminate the convert_function. Otherwise we may be breaking up a
+    // forwarding chain in favor of additional ARC traffic which isn't
+    // canonical.
+    SingleBlockOwnedForwardingInstFolder folder(*this, cfi);
+    if (folder.add(subCFI))
+      return std::move(folder).optimizeWithSetValue(subCFI->getConverted());
   }
-  
+
   // Replace a convert_function that only has refcounting uses with its
   // operand.
-  auto anyNonRefCountUse =
-    std::any_of(CFI->use_begin(),
-                CFI->use_end(),
-                [](Operand *Use) {
-                  return !isa<RefCountingInst>(Use->getUser());
-                });
-
-  if (anyNonRefCountUse)
-    return nullptr;
-
-  // Replace all retain/releases on convert_function by retain/releases on
-  // its argument. This is required to preserve the lifetime of its argument,
-  // which could be e.g. a partial_apply instruction capturing some further
-  // arguments.
-  auto Converted = CFI->getConverted();
-  while (!CFI->use_empty()) {
-    auto *Use = *(CFI->use_begin());
-    assert(Use->getUser()->getResults().empty() &&
-           "Did not expect user with a result!");
-    Use->set(Converted);
-  }
-
-  eraseInstFromFunction(*CFI);
+  tryEliminateOnlyOwnershipUsedForwardingInst(cfi, instModCallbacks);
   return nullptr;
 }

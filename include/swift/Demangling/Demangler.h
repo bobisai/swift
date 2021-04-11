@@ -520,7 +520,7 @@ protected:
   NodePointer demangleInitializer();
   NodePointer demangleImplParamConvention(Node::Kind ConvKind);
   NodePointer demangleImplResultConvention(Node::Kind ConvKind);
-  NodePointer demangleImplDifferentiability();
+  NodePointer demangleImplParameterResultDifferentiability();
   NodePointer demangleImplFunctionType();
   NodePointer demangleClangType();
   NodePointer demangleMetatype();
@@ -569,8 +569,15 @@ protected:
 
   NodePointer demangleTypeMangling();
   NodePointer demangleSymbolicReference(unsigned char rawKind);
+  NodePointer demangleTypeAnnotation();
+
+  NodePointer demangleAutoDiffFunctionOrSimpleThunk(Node::Kind nodeKind);
   NodePointer demangleAutoDiffFunctionKind();
+  NodePointer demangleAutoDiffSubsetParametersThunk();
+  NodePointer demangleAutoDiffSelfReorderingReabstractionThunk();
+  NodePointer demangleDifferentiabilityWitness();
   NodePointer demangleIndexSubset();
+  NodePointer demangleDifferentiableFunctionType();
 
   bool demangleBoundGenerics(Vector<NodePointer> &TypeListList,
                              NodePointer &RetroactiveConformances);

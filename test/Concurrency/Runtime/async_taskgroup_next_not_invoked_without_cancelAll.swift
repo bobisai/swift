@@ -1,40 +1,51 @@
-// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-concurrency) | %FileCheck %s --dump-input=always
+// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-concurrency %import-libdispatch -parse-as-library) | %FileCheck %s --dump-input=always
+
 // REQUIRES: executable_test
 // REQUIRES: concurrency
-// REQUIRES: OS=macosx
-// REQUIRES: CPU=x86_64
+// REQUIRES: libdispatch
 
-import func Foundation.sleep
+// rdar://76038845
+// UNSUPPORTED: use_os_stdlib
 
+import Dispatch
+
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
 func test_skipCallingNext() async {
   let numbers = [1, 1]
 
-  let result = try! await Task.withGroup(resultType: Int.self) { (group) async -> Int in
+  let result = try! await withTaskGroup(of: Int.self) { (group) async -> Int in
     for n in numbers {
-      print("group.add { \(n) }")
-      await group.add { () async -> Int in
-        sleep(1)
-        print("  inside group.add { \(n) } (canceled: \(await Task.isCanceled()))")
+      print("group.spawn { \(n) }")
+      group.spawn { () async -> Int in
+        await Task.sleep(1_000_000_000)
+        let c = Task.isCancelled
+        print("  inside group.spawn { \(n) } (canceled: \(c))")
         return n
       }
     }
 
     // return immediately; the group should wait on the tasks anyway
-    print("return immediately 0 (canceled: \(await Task.isCanceled()))")
+    let c = Task.isCancelled
+    print("return immediately 0 (canceled: \(c))")
     return 0
   }
 
-  // CHECK: group.add { 1 }
-  // CHECK: group.add { 1 }
+  // CHECK: group.spawn { 1 }
+  // CHECK: group.spawn { 1 }
   // CHECK: return immediately 0 (canceled: false)
 
-  // CHECK: inside group.add { 1 } (canceled: false)
-  // CHECK: inside group.add { 1 } (canceled: false)
+  // CHECK: inside group.spawn { 1 } (canceled: false)
+  // CHECK: inside group.spawn { 1 } (canceled: false)
 
   // CHECK: result: 0
   print("result: \(result)")
   assert(result == 0)
 }
 
-runAsyncAndBlock(test_skipCallingNext)
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
+@main struct Main {
+  static func main() async {
+    await test_skipCallingNext()
+  }
+}
 

@@ -95,11 +95,6 @@ Action(llvm::cl::desc("Action (required):"),
                    "of the EOF token, and dump the buffer from the start of the"
                    "file to the EOF token")));
 
-static llvm::cl::opt<bool> EnableExperimentalPrespecialization(
-    "enable-experimental-prespecialization",
-    llvm::cl::desc("Enable experimental prespecialization"),
-    llvm::cl::init(false));
-
 static llvm::cl::opt<std::string>
 InputSourceFilename("input-source-filename",
                     llvm::cl::desc("Path to the input .swift file"));
@@ -154,12 +149,6 @@ static llvm::cl::opt<bool>
 OmitNodeIds("omit-node-ids",
             llvm::cl::desc("If specified, the serialized syntax tree will not "
                            "include the IDs of the serialized nodes."));
-
-static llvm::cl::opt<bool>
-IncrementalSerialization("incremental-serialization",
-                         llvm::cl::desc("If specified, the serialized syntax "
-                                        "tree will omit nodes that have not "
-                                        "changed since the last parse."));
 
 static llvm::cl::opt<std::string>
 OutputFilename("output-filename",
@@ -289,26 +278,22 @@ struct ByteBasedSourceRangeSet {
   }
 };
 
-int getTokensFromFile(unsigned BufferID,
-                      LangOptions &LangOpts,
-                      SourceManager &SourceMgr,
-                      swift::DiagnosticEngine &Diags,
-                      std::vector<std::pair<RC<syntax::RawSyntax>,
-                      syntax::AbsolutePosition>> &Tokens) {
-  Tokens = tokenizeWithTrivia(LangOpts, SourceMgr, BufferID,
-                              /*Offset=*/0, /*EndOffset=*/0,
-                              &Diags);
+int getTokensFromFile(
+    unsigned BufferID, LangOptions &LangOpts, SourceManager &SourceMgr,
+    const RC<SyntaxArena> &Arena, swift::DiagnosticEngine &Diags,
+    std::vector<std::pair<const syntax::RawSyntax *,
+                          syntax::AbsoluteOffsetPosition>> &Tokens) {
+  Tokens = tokenizeWithTrivia(LangOpts, SourceMgr, BufferID, Arena,
+                              /*Offset=*/0, /*EndOffset=*/0, &Diags);
   return EXIT_SUCCESS;
 }
 
-
-int
-getTokensFromFile(const StringRef InputFilename,
-                  LangOptions &LangOpts,
-                  SourceManager &SourceMgr,
-                  DiagnosticEngine &Diags,
-                  std::vector<std::pair<RC<syntax::RawSyntax>,
-                                        syntax::AbsolutePosition>> &Tokens) {
+int getTokensFromFile(
+    const StringRef InputFilename, LangOptions &LangOpts,
+    SourceManager &SourceMgr, const RC<SyntaxArena> &Arena,
+    DiagnosticEngine &Diags, unsigned int &OutBufferID,
+    std::vector<std::pair<const syntax::RawSyntax *,
+                          syntax::AbsoluteOffsetPosition>> &Tokens) {
   auto Buffer = llvm::MemoryBuffer::getFile(InputFilename);
   if (!Buffer) {
     Diags.diagnose(SourceLoc(), diag::cannot_open_file,
@@ -316,8 +301,9 @@ getTokensFromFile(const StringRef InputFilename,
     return EXIT_FAILURE;
   }
 
-  auto BufferID = SourceMgr.addNewSourceBuffer(std::move(Buffer.get()));
-  return getTokensFromFile(BufferID, LangOpts, SourceMgr, Diags, Tokens);
+  OutBufferID = SourceMgr.addNewSourceBuffer(std::move(Buffer.get()));
+  return getTokensFromFile(OutBufferID, LangOpts, SourceMgr, Arena, Diags,
+                           Tokens);
 }
 
 void anchorForGetMainExecutable() {}
@@ -595,8 +581,6 @@ int parseFile(
   Invocation.getLangOptions().ParseForSyntaxTreeOnly = true;
   Invocation.getLangOptions().VerifySyntaxTree = options::VerifySyntaxTree;
   Invocation.getLangOptions().DisablePoundIfEvaluation = true;
-  Invocation.getLangOptions().EnableExperimentalPrespecialization =
-      options::EnableExperimentalPrespecialization;
 
   Invocation.getFrontendOptions().InputsAndOutputs.addInputFile(InputFileName);
 
@@ -674,10 +658,13 @@ int doFullLexRoundTrip(const StringRef InputFilename) {
   PrintingDiagnosticConsumer DiagPrinter;
   Diags.addConsumer(DiagPrinter);
 
-  std::vector<std::pair<RC<syntax::RawSyntax>,
-                                   syntax::AbsolutePosition>> Tokens;
-  if (getTokensFromFile(InputFilename, LangOpts, SourceMgr,
-                        Diags, Tokens) == EXIT_FAILURE) {
+  unsigned int BufferID;
+  RC<SyntaxArena> Arena = SyntaxArena::make();
+  std::vector<
+      std::pair<const syntax::RawSyntax *, syntax::AbsoluteOffsetPosition>>
+      Tokens;
+  if (getTokensFromFile(InputFilename, LangOpts, SourceMgr, Arena, Diags,
+                        BufferID, Tokens) == EXIT_FAILURE) {
     return EXIT_FAILURE;
   }
 
@@ -695,15 +682,22 @@ int doDumpRawTokenSyntax(const StringRef InputFile) {
   PrintingDiagnosticConsumer DiagPrinter;
   Diags.addConsumer(DiagPrinter);
 
-  std::vector<std::pair<RC<syntax::RawSyntax>,
-                        syntax::AbsolutePosition>> Tokens;
-  if (getTokensFromFile(InputFile, LangOpts, SourceMgr, Diags, Tokens) ==
-      EXIT_FAILURE) {
+  unsigned int BufferID;
+  RC<SyntaxArena> Arena = SyntaxArena::make();
+  std::vector<
+      std::pair<const syntax::RawSyntax *, syntax::AbsoluteOffsetPosition>>
+      Tokens;
+  if (getTokensFromFile(InputFile, LangOpts, SourceMgr, Arena, Diags, BufferID,
+                        Tokens) == EXIT_FAILURE) {
     return EXIT_FAILURE;
   }
 
   for (auto TokAndPos : Tokens) {
-    llvm::outs() << TokAndPos.second << "\n";
+    SourceLoc Loc =
+        SourceMgr.getLocForOffset(BufferID, TokAndPos.second.getOffset());
+    unsigned Line, Column;
+    std::tie(Line, Column) = SourceMgr.getPresumedLineAndColumnForLoc(Loc);
+    llvm::outs() << Line << ":" << Column << "\n";
     TokAndPos.first->dump(llvm::outs());
     llvm::outs() << "\n";
   }
@@ -725,35 +719,20 @@ int doSerializeRawTree(const char *MainExecutablePath,
   return parseFile(MainExecutablePath, InputFile,
     [](ParseInfo info) -> int {
     auto SF = info.SF;
-    auto SyntaxCache = info.SyntaxCache;
     auto Root = SF->getSyntaxRoot().getRaw();
-    std::unordered_set<unsigned> ReusedNodeIds;
-    if (options::IncrementalSerialization && SyntaxCache) {
-      ReusedNodeIds = SyntaxCache->getReusedNodeIds();
-    }
-
-    auto SerializeTree = [&ReusedNodeIds](llvm::raw_ostream &os,
-                                          RC<RawSyntax> Root,
-                                          SyntaxParsingCache *SyntaxCache) {
-      swift::json::Output::UserInfoMap JsonUserInfo;
-      JsonUserInfo[swift::json::OmitNodesUserInfoKey] = &ReusedNodeIds;
-      if (options::OmitNodeIds) {
-        JsonUserInfo[swift::json::DontSerializeNodeIdsUserInfoKey] =
-            (void *)true;
-      }
-      swift::json::Output out(os, JsonUserInfo);
-      out << *Root;
-      os << "\n";
-    };
 
     if (!options::OutputFilename.empty()) {
       std::error_code errorCode;
       llvm::raw_fd_ostream os(options::OutputFilename, errorCode,
                               llvm::sys::fs::F_None);
       assert(!errorCode && "Couldn't open output file");
-      SerializeTree(os, Root, SyntaxCache);
+      swift::json::Output out(os);
+      out << *Root;
+      os << "\n";
     } else {
-      SerializeTree(llvm::outs(), Root, SyntaxCache);
+      swift::json::Output out(llvm::outs());
+      out << *Root;
+      llvm::outs() << "\n";
     }
 
     if (!options::DiagsOutputFilename.empty()) {
@@ -824,8 +803,7 @@ int dumpEOFSourceLoc(const char *MainExecutablePath,
 
     // To ensure the correctness of position when translated to line & column
     // pair.
-    if (SourceMgr.getPresumedLineAndColumnForLoc(EndLoc) !=
-        AbPos.getLineAndColumn()) {
+    if (SourceMgr.getLocOffsetInBuffer(EndLoc, BufferId) != AbPos.getOffset()) {
       llvm::outs() << "locations should be identical";
       return EXIT_FAILURE;
     }

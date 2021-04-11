@@ -522,6 +522,9 @@ public:
   /// Get Sequence.makeIterator().
   FuncDecl *getSequenceMakeIterator() const;
 
+  /// Get AsyncSequence.makeAsyncIterator().
+  FuncDecl *getAsyncSequenceMakeAsyncIterator() const;
+
   /// Check whether the standard library provides all the correct
   /// intrinsic support for Optional<T>.
   ///
@@ -734,6 +737,10 @@ public:
   /// Get the runtime availability of features introduced in the Swift 5.4
   /// compiler for the target platform.
   AvailabilityContext getSwift54Availability();
+
+  /// Get the runtime availability of features introduced in the Swift 5.5
+  /// compiler for the target platform.
+  AvailabilityContext getSwift55Availability();
 
   /// Get the runtime availability of features that have been introduced in the
   /// Swift compiler for future versions of the target platform.
@@ -983,7 +990,13 @@ public:
 
   /// Check whether current context has any errors associated with
   /// ill-formed protocol conformances which haven't been produced yet.
-  bool hasDelayedConformanceErrors() const;
+  ///
+  /// @param conformance if non-null, will check only for errors specific to the
+  /// provided conformance. Otherwise, checks for _any_ errors.
+  ///
+  /// @returns true iff there are any delayed diagnostic errors
+  bool hasDelayedConformanceErrors(
+                  NormalProtocolConformance const* conformance = nullptr) const;
 
   /// Add a delayed diagnostic produced while type-checking a
   /// particular protocol conformance.
@@ -993,7 +1006,7 @@ public:
   /// Retrieve the delayed-conformance diagnostic callbacks for the
   /// given normal protocol conformance.
   std::vector<DelayedConformanceDiag>
-  takeDelayedConformanceDiags(NormalProtocolConformance *conformance);
+  takeDelayedConformanceDiags(NormalProtocolConformance const* conformance);
 
   /// Add delayed missing witnesses for the given normal protocol conformance.
   void addDelayedMissingWitnesses(
@@ -1151,10 +1164,14 @@ public:
   /// standard library's String implementation.
   bool isASCIIString(StringRef s) const;
 
+  /// Retrieve the name of to be used for the entry point, either main or an
+  /// alternative specified via the -entry-point-function-name frontend flag.
+  std::string getEntryPointFunctionName() const;
+
 private:
   friend Decl;
-  Optional<RawComment> getRawComment(const Decl *D);
-  void setRawComment(const Decl *D, RawComment RC);
+  Optional<std::pair<RawComment, bool>> getRawComment(const Decl *D);
+  void setRawComment(const Decl *D, RawComment RC, bool FromSerialized);
 
   Optional<StringRef> getBriefComment(const Decl *D);
   void setBriefComment(const Decl *D, StringRef Comment);

@@ -537,6 +537,10 @@ bool swift::performLLVM(const IRGenOptions &Opts,
       RawOS->clear_error();
       return true;
     }
+    if (Opts.OutputKind == IRGenOutputKind::LLVMAssemblyBeforeOptimization) {
+      Module->print(RawOS.getValue(), nullptr);
+      return false;
+    }
   } else {
     assert(Opts.OutputKind == IRGenOutputKind::Module && "no output specified");
   }
@@ -569,9 +573,11 @@ bool swift::compileAndWriteLLVM(llvm::Module *module,
 
   // Set up the final emission passes.
   switch (opts.OutputKind) {
+  case IRGenOutputKind::LLVMAssemblyBeforeOptimization:
+    llvm_unreachable("Should be handled earlier.");
   case IRGenOutputKind::Module:
     break;
-  case IRGenOutputKind::LLVMAssembly:
+  case IRGenOutputKind::LLVMAssemblyAfterOptimization:
     EmitPasses.add(createPrintModulePass(out));
     break;
   case IRGenOutputKind::LLVMBitcode: {
@@ -638,6 +644,11 @@ static void setPointerAuthOptions(PointerAuthOptions &opts,
   // might end up on a global constant initializer.
   auto nonABICodeKey = PointerAuthSchema::ARM8_3Key::ASIB;
 
+  // A key suitable for data pointers that are only used in private
+  // situations.  Do not use this key for any sort of signature that
+  // might end up on a global constant initializer.
+  auto nonABIDataKey = PointerAuthSchema::ARM8_3Key::ASDB;
+
   // If you change anything here, be sure to update <ptrauth.h>.
   opts.SwiftFunctionPointers =
     PointerAuthSchema(codeKey, /*address*/ false, Discrimination::Type);
@@ -691,6 +702,24 @@ static void setPointerAuthOptions(PointerAuthOptions &opts,
       PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Constant,
       SpecialPointerAuthDiscriminators::ResilientClassStubInitCallback);
 
+  opts.AsyncSwiftFunctionPointers =
+      PointerAuthSchema(dataKey, /*address*/ false, Discrimination::Type);
+
+  opts.AsyncSwiftClassMethods =
+      PointerAuthSchema(dataKey, /*address*/ true, Discrimination::Decl);
+
+  opts.AsyncProtocolWitnesses =
+      PointerAuthSchema(dataKey, /*address*/ true, Discrimination::Decl);
+
+  opts.AsyncSwiftClassMethodPointers =
+      PointerAuthSchema(dataKey, /*address*/ false, Discrimination::Decl);
+
+  opts.AsyncSwiftDynamicReplacements =
+      PointerAuthSchema(dataKey, /*address*/ true, Discrimination::Decl);
+
+  opts.AsyncPartialApplyCapture =
+      PointerAuthSchema(nonABIDataKey, /*address*/ true, Discrimination::Decl);
+
   opts.AsyncContextParent =
       PointerAuthSchema(dataKey, /*address*/ true, Discrimination::Constant,
                         SpecialPointerAuthDiscriminators::AsyncContextParent);
@@ -702,6 +731,14 @@ static void setPointerAuthOptions(PointerAuthOptions &opts,
   opts.TaskResumeFunction =
       PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Constant,
                         SpecialPointerAuthDiscriminators::TaskResumeFunction);
+
+  opts.TaskResumeContext =
+      PointerAuthSchema(dataKey, /*address*/ true, Discrimination::Constant,
+                        SpecialPointerAuthDiscriminators::TaskResumeContext);
+
+  opts.AsyncContextExtendedFrameEntry = PointerAuthSchema(
+      dataKey, /*address*/ true, Discrimination::Constant,
+      SpecialPointerAuthDiscriminators::SwiftAsyncContextExtendedFrameEntry);
 }
 
 std::unique_ptr<llvm::TargetMachine>
@@ -1463,6 +1500,7 @@ swift::createSwiftModuleObjectFile(SILModule &SILMod, StringRef Buffer,
                                           Data, "__Swift_AST");
   std::string Section;
   switch (IGM.TargetInfo.OutputObjectFormat) {
+  case llvm::Triple::GOFF:
   case llvm::Triple::UnknownObjectFormat:
     llvm_unreachable("unknown object format");
   case llvm::Triple::XCOFF:

@@ -16,6 +16,7 @@
 
 #include "swift/Parse/Parser.h"
 #include "swift/AST/ASTWalker.h"
+#include "swift/AST/Attr.h"
 #include "swift/AST/DiagnosticsParse.h"
 #include "swift/AST/TypeRepr.h"
 #include "swift/Basic/EditorPlaceholder.h"
@@ -128,8 +129,9 @@ ParserResult<Expr> Parser::parseExprArrow() {
   SourceLoc asyncLoc, throwsLoc, arrowLoc;
   ParserStatus status;
 
-  status |= parseEffectsSpecifiers(SourceLoc(), asyncLoc, throwsLoc,
-                                   /*rethrows=*/nullptr);
+  status |= parseEffectsSpecifiers(SourceLoc(),
+                                   asyncLoc, /*reasync=*/nullptr,
+                                   throwsLoc, /*rethrows=*/nullptr);
   if (status.hasCodeCompletion() && !CodeCompletion) {
     // Trigger delayed parsing, no need to continue.
     return status;
@@ -145,7 +147,9 @@ ParserResult<Expr> Parser::parseExprArrow() {
 
   arrowLoc = consumeToken(tok::arrow);
 
-  parseEffectsSpecifiers(arrowLoc, asyncLoc, throwsLoc, /*rethrows=*/nullptr);
+  parseEffectsSpecifiers(arrowLoc,
+                         asyncLoc, /*reasync=*/nullptr,
+                         throwsLoc, /*rethrows=*/nullptr);
 
   auto arrow = new (Context) ArrowExpr(asyncLoc, throwsLoc, arrowLoc);
   return makeParserResult(arrow);
@@ -337,8 +341,7 @@ parse_operator:
     case tok::identifier: {
       // 'async' followed by 'throws' or '->' implies that we have an arrow
       // expression.
-      if (!(shouldParseExperimentalConcurrency() &&
-            Tok.isContextualKeyword("async") &&
+      if (!(Tok.isContextualKeyword("async") &&
             peekToken().isAny(tok::arrow, tok::kw_throws)))
         goto done;
 
@@ -399,29 +402,33 @@ ParserResult<Expr> Parser::parseExprSequenceElement(Diag<> message,
   SyntaxParsingContext ElementContext(SyntaxContext,
                                       SyntaxContextKind::Expr);
 
-  if (Tok.isContextualKeyword("await")) {
-    if (shouldParseExperimentalConcurrency()) {
-      SourceLoc awaitLoc = consumeToken();
-      ParserResult<Expr> sub =
-        parseExprSequenceElement(diag::expected_expr_after_await, isExprBasic);
-      if (!sub.hasCodeCompletion() && !sub.isNull()) {
-        if (auto anyTry = dyn_cast<AnyTryExpr>(sub.get())) {
-          // "try" must precede "await".
-          diagnose(awaitLoc, diag::await_before_try)
-            .fixItRemove(awaitLoc)
-            .fixItInsert(anyTry->getSubExpr()->getStartLoc(), "await ");
-        }
-
-        ElementContext.setCreateSyntax(SyntaxKind::AwaitExpr);
-        sub = makeParserResult(new (Context) AwaitExpr(awaitLoc, sub.get()));
+  // Check whether the user mistyped "async" for "await", but only in cases
+  // where we are sure that "async" would be ill-formed as an identifier.
+  bool isReplaceableAsync = Tok.isContextualKeyword("async") &&
+    !peekToken().isAtStartOfLine() &&
+    (peekToken().is(tok::identifier) || peekToken().is(tok::kw_try));
+  if (Tok.isContextualKeyword("await") || isReplaceableAsync) {
+    // Error on a replaceable async
+    if (isReplaceableAsync) {
+      diagnose(Tok.getLoc(), diag::expected_await_not_async)
+        .fixItReplace(Tok.getLoc(), "await");
+    }
+    SourceLoc awaitLoc = consumeToken();
+    ParserResult<Expr> sub =
+      parseExprSequenceElement(diag::expected_expr_after_await, isExprBasic);
+    if (!sub.hasCodeCompletion() && !sub.isNull()) {
+      if (auto anyTry = dyn_cast<AnyTryExpr>(sub.get())) {
+        // "try" must precede "await".
+        diagnose(awaitLoc, diag::await_before_try)
+          .fixItRemove(awaitLoc)
+          .fixItInsert(anyTry->getSubExpr()->getStartLoc(), "await ");
       }
 
-      return sub;
-    } else {
-      // warn that future versions of Swift will parse this token differently.
-      diagnose(Tok.getLoc(), diag::warn_await_keyword)
-        .fixItReplace(Tok.getLoc(), "`await`");
+      ElementContext.setCreateSyntax(SyntaxKind::AwaitExpr);
+      sub = makeParserResult(new (Context) AwaitExpr(awaitLoc, sub.get()));
     }
+
+   return sub;
   }
 
   SourceLoc tryLoc;
@@ -526,7 +533,7 @@ ParserResult<Expr> Parser::parseExprUnary(Diag<> Message, bool isExprBasic) {
 
     ParserResult<Expr> SubExpr = parseExprUnary(Message, isExprBasic);
     if (SubExpr.hasCodeCompletion())
-      return makeParserCodeCompletionResult<Expr>();
+      return makeParserCodeCompletionResult<Expr>(SubExpr.getPtrOrNull());
     if (SubExpr.isNull())
       return nullptr;
     return makeParserResult(
@@ -1721,7 +1728,6 @@ parseStringSegments(SmallVectorImpl<Lexer::StringSegment> &Segments,
                     unsigned &InterpolationCount) {
   SourceLoc Loc = EntireTok.getLoc();
   ParserStatus Status;
-  ParsedTrivia EmptyTrivia;
   bool First = true;
 
   DeclNameRef appendLiteral(
@@ -1776,7 +1782,7 @@ parseStringSegments(SmallVectorImpl<Lexer::StringSegment> &Segments,
       // such token to the context.
       Token content(tok::string_segment,
                     CharSourceRange(Segment.Loc, Segment.Length).str());
-      SyntaxContext->addToken(content, EmptyTrivia, EmptyTrivia);
+      SyntaxContext->addToken(content, StringRef(), StringRef());
       break;
     }
         
@@ -1790,14 +1796,14 @@ parseStringSegments(SmallVectorImpl<Lexer::StringSegment> &Segments,
       // Backslash is part of an expression segment.
       SourceLoc BackSlashLoc = Segment.Loc.getAdvancedLoc(-1 - DelimiterLen);
       Token BackSlash(tok::backslash, CharSourceRange(BackSlashLoc, 1).str());
-      ExprContext.addToken(BackSlash, EmptyTrivia, EmptyTrivia);
+      ExprContext.addToken(BackSlash, StringRef(), StringRef());
 
       // Custom delimiter may be a part of an expression segment.
       if (HasCustomDelimiter) {
         SourceLoc DelimiterLoc = Segment.Loc.getAdvancedLoc(-DelimiterLen);
         Token Delimiter(tok::raw_string_delimiter,
                         CharSourceRange(DelimiterLoc, DelimiterLen).str());
-        ExprContext.addToken(Delimiter, EmptyTrivia, EmptyTrivia);
+        ExprContext.addToken(Delimiter, StringRef(), StringRef());
       }
 
       // Create a temporary lexer that lexes from the body of the string.
@@ -1856,7 +1862,7 @@ parseStringSegments(SmallVectorImpl<Lexer::StringSegment> &Segments,
         Tok.setKind(tok::string_interpolation_anchor);
         // We don't allow trailing trivia for this anchor, because the
         // trivia is a part of the next string segment.
-        TrailingTrivia.clear();
+        TrailingTrivia = StringRef();
         consumeToken();
       }
       break;
@@ -1900,18 +1906,17 @@ ParserResult<Expr> Parser::parseExprStringLiteral() {
   // Make unknown tokens to represent the open and close quote.
   Token OpenQuote(QuoteKind, OpenQuoteStr);
   Token CloseQuote(QuoteKind, CloseQuoteStr);
-  ParsedTrivia EmptyTrivia;
-  ParsedTrivia EntireTrailingTrivia = TrailingTrivia;
+  StringRef EntireTrailingTrivia = TrailingTrivia;
 
   if (HasCustomDelimiter) {
     Token OpenDelimiter(tok::raw_string_delimiter, OpenDelimiterStr);
     // When a custom delimiter is present, it owns the leading trivia.
-    SyntaxContext->addToken(OpenDelimiter, LeadingTrivia, EmptyTrivia);
+    SyntaxContext->addToken(OpenDelimiter, LeadingTrivia, StringRef());
 
-    SyntaxContext->addToken(OpenQuote, EmptyTrivia, EmptyTrivia);
+    SyntaxContext->addToken(OpenQuote, StringRef(), StringRef());
   } else {
     // Without custom delimiter the quote owns trailing trivia.
-    SyntaxContext->addToken(OpenQuote, LeadingTrivia, EmptyTrivia);
+    SyntaxContext->addToken(OpenQuote, LeadingTrivia, StringRef());
   }
 
   // The simple case: just a single literal segment.
@@ -1932,18 +1937,19 @@ ParserResult<Expr> Parser::parseExprStringLiteral() {
       auto Segment = Segments.front();
       Token content(tok::string_segment,
                     CharSourceRange(Segment.Loc, Segment.Length).str());
-      SyntaxContext->addToken(content, EmptyTrivia, EmptyTrivia);
+      SyntaxContext->addToken(content, StringRef(), StringRef());
     }
 
     if (HasCustomDelimiter) {
-      SyntaxContext->addToken(CloseQuote, EmptyTrivia, EmptyTrivia);
+      SyntaxContext->addToken(CloseQuote, StringRef(), StringRef());
 
       Token CloseDelimiter(tok::raw_string_delimiter, CloseDelimiterStr);
       // When a custom delimiter is present it owns the trailing trivia.
-      SyntaxContext->addToken(CloseDelimiter, EmptyTrivia, EntireTrailingTrivia);
+      SyntaxContext->addToken(CloseDelimiter, StringRef(),
+                              EntireTrailingTrivia);
     } else {
       // Without custom delimiter the quote owns trailing trivia.
-      SyntaxContext->addToken(CloseQuote, EmptyTrivia, EntireTrailingTrivia);
+      SyntaxContext->addToken(CloseQuote, StringRef(), EntireTrailingTrivia);
     }
 
     return makeParserResult(
@@ -1956,8 +1962,8 @@ ParserResult<Expr> Parser::parseExprStringLiteral() {
   // We are going to mess with Tok to do reparsing for interpolated literals,
   // don't lose our 'next' token.
   llvm::SaveAndRestore<Token> SavedTok(Tok);
-  llvm::SaveAndRestore<ParsedTrivia> SavedLeadingTrivia(LeadingTrivia);
-  llvm::SaveAndRestore<ParsedTrivia> SavedTrailingTrivia(TrailingTrivia);
+  llvm::SaveAndRestore<StringRef> SavedLeadingTrivia(LeadingTrivia);
+  llvm::SaveAndRestore<StringRef> SavedTrailingTrivia(TrailingTrivia);
   // For errors, we need the real PreviousLoc, i.e. the start of the
   // whole InterpolatedStringLiteral.
   llvm::SaveAndRestore<SourceLoc> SavedPreviousLoc(PreviousLoc);
@@ -2002,14 +2008,14 @@ ParserResult<Expr> Parser::parseExprStringLiteral() {
   }
 
   if (HasCustomDelimiter) {
-    SyntaxContext->addToken(CloseQuote, EmptyTrivia, EmptyTrivia);
+    SyntaxContext->addToken(CloseQuote, StringRef(), StringRef());
 
     Token CloseDelimiter(tok::raw_string_delimiter, CloseDelimiterStr);
     // When a custom delimiter is present it owns the trailing trivia.
-    SyntaxContext->addToken(CloseDelimiter, EmptyTrivia, EntireTrailingTrivia);
+    SyntaxContext->addToken(CloseDelimiter, StringRef(), EntireTrailingTrivia);
   } else {
     // Without custom delimiter the quote owns trailing trivia.
-    SyntaxContext->addToken(CloseQuote, EmptyTrivia, EntireTrailingTrivia);
+    SyntaxContext->addToken(CloseQuote, StringRef(), EntireTrailingTrivia);
   }
 
   if (AppendingExpr->getBody()->getNumElements() == 1) {
@@ -2042,7 +2048,7 @@ void Parser::parseOptionalArgumentLabel(Identifier &name, SourceLoc &loc) {
           .fixItRemoveChars(end.getAdvancedLoc(-1), end);
     }
 
-    loc = consumeArgumentLabel(name);
+    loc = consumeArgumentLabel(name, /*diagnoseDollarPrefix=*/false);
     consumeToken(tok::colon);
   }
 }
@@ -2077,7 +2083,7 @@ static bool tryParseArgLabelList(Parser &P, Parser::DeclNameOptions flags,
 
   // Try to parse a compound name.
   SyntaxParsingContext ArgsCtxt(P.SyntaxContext, SyntaxKind::DeclNameArguments);
-  Parser::BacktrackingScope backtrack(P);
+  Parser::CancellableBacktrackingScope backtrack(P);
 
   lparenLoc = P.consumeToken(tok::l_paren);
   while (P.Tok.isNot(tok::r_paren)) {
@@ -2330,6 +2336,7 @@ static void printTupleNames(const TypeRepr *typeRepr, llvm::raw_ostream &OS) {
 }
 
 ParserStatus Parser::parseClosureSignatureIfPresent(
+    DeclAttributes &attributes,
     SourceRange &bracketRange,
     SmallVectorImpl<CaptureListEntry> &captureList,
     VarDecl *&capturedSelfDecl,
@@ -2339,6 +2346,7 @@ ParserStatus Parser::parseClosureSignatureIfPresent(
     TypeExpr *&explicitResultType, SourceLoc &inLoc) {
   // Clear out result parameters.
   bracketRange = SourceRange();
+  attributes = DeclAttributes();
   capturedSelfDecl = nullptr;
   params = nullptr;
   throwsLoc = SourceLoc();
@@ -2355,8 +2363,15 @@ ParserStatus Parser::parseClosureSignatureIfPresent(
 
   // If we have a leading token that may be part of the closure signature, do a
   // speculative parse to validate it and look for 'in'.
-  if (Tok.isAny(tok::l_paren, tok::l_square, tok::identifier, tok::kw__)) {
+  if (Tok.isAny(
+          tok::at_sign, tok::l_paren, tok::l_square, tok::identifier,
+          tok::kw__)) {
     BacktrackingScope backtrack(*this);
+
+    // Consume attributes.
+    while (Tok.is(tok::at_sign)) {
+      skipAnyAttribute();
+    }
 
     // Skip by a closure capture list if present.
     if (consumeIf(tok::l_square)) {
@@ -2420,6 +2435,9 @@ ParserStatus Parser::parseClosureSignatureIfPresent(
   }
   ParserStatus status;
   SyntaxParsingContext ClosureSigCtx(SyntaxContext, SyntaxKind::ClosureSignature);
+
+  (void)parseDeclAttributeList(attributes);
+
   if (Tok.is(tok::l_square) && peekToken().is(tok::r_square)) {
     
     SyntaxParsingContext CaptureCtx(SyntaxContext,
@@ -2581,7 +2599,7 @@ ParserStatus Parser::parseClosureSignatureIfPresent(
         Identifier name;
         SourceLoc nameLoc;
         if (Tok.is(tok::identifier)) {
-          nameLoc = consumeIdentifier(name, /*diagnoseDollarPrefix=*/true);
+          nameLoc = consumeIdentifier(name, /*diagnoseDollarPrefix=*/false);
         } else {
           nameLoc = consumeToken(tok::kw__);
         }
@@ -2598,8 +2616,9 @@ ParserStatus Parser::parseClosureSignatureIfPresent(
       params = ParameterList::create(Context, elements);
     }
 
-    status |= parseEffectsSpecifiers(SourceLoc(), asyncLoc, throwsLoc,
-                                     /*rethrows*/nullptr);
+    status |= parseEffectsSpecifiers(SourceLoc(),
+                                     asyncLoc, /*reasync*/nullptr,
+                                     throwsLoc, /*rethrows*/nullptr);
 
     // Parse the optional explicit return type.
     if (Tok.is(tok::arrow)) {
@@ -2618,8 +2637,9 @@ ParserStatus Parser::parseClosureSignatureIfPresent(
         explicitResultType = new (Context) TypeExpr(explicitResultTypeRepr);
 
         // Check for 'throws' and 'rethrows' after the type and correct it.
-        parseEffectsSpecifiers(arrowLoc, asyncLoc, throwsLoc,
-                               /*rethrows*/nullptr);
+        parseEffectsSpecifiers(arrowLoc,
+                               asyncLoc, /*reasync*/nullptr,
+                               throwsLoc, /*rethrows*/nullptr);
       }
     }
   }
@@ -2714,6 +2734,7 @@ ParserResult<Expr> Parser::parseExprClosure() {
   SourceLoc leftBrace = consumeToken();
 
   // Parse the closure-signature, if present.
+  DeclAttributes attributes;
   SourceRange bracketRange;
   SmallVector<CaptureListEntry, 2> captureList;
   VarDecl *capturedSelfDecl;
@@ -2724,8 +2745,8 @@ ParserResult<Expr> Parser::parseExprClosure() {
   TypeExpr *explicitResultType;
   SourceLoc inLoc;
   Status |= parseClosureSignatureIfPresent(
-      bracketRange, captureList, capturedSelfDecl, params, asyncLoc, throwsLoc,
-      arrowLoc, explicitResultType, inLoc);
+      attributes, bracketRange, captureList, capturedSelfDecl, params, asyncLoc,
+      throwsLoc, arrowLoc, explicitResultType, inLoc);
 
   // If the closure was created in the context of an array type signature's
   // size expression, there will not be a local context. A parse error will
@@ -2741,8 +2762,8 @@ ParserResult<Expr> Parser::parseExprClosure() {
 
   // Create the closure expression and enter its context.
   auto *closure = new (Context) ClosureExpr(
-      bracketRange, capturedSelfDecl, params, asyncLoc, throwsLoc, arrowLoc,
-      inLoc, explicitResultType, discriminator, CurDeclContext);
+      attributes, bracketRange, capturedSelfDecl, params, asyncLoc, throwsLoc,
+      arrowLoc, inLoc, explicitResultType, discriminator, CurDeclContext);
   ParseFunctionBody cc(*this, closure);
 
   // Handle parameters.
@@ -3154,7 +3175,7 @@ Parser::parseTrailingClosures(bool isExprBasic, SourceRange calleeRange,
     SyntaxParsingContext ClosureCtx(SyntaxContext,
                                     SyntaxKind::MultipleTrailingClosureElement);
     Identifier label;
-    auto labelLoc = consumeArgumentLabel(label);
+    auto labelLoc = consumeArgumentLabel(label, /*diagnoseDollarPrefix=*/false);
     consumeToken(tok::colon);
     ParserResult<Expr> closure;
     if (Tok.is(tok::l_brace)) {

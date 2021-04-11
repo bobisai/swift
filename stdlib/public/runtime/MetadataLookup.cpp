@@ -33,7 +33,7 @@
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/StringExtras.h"
 #include "Private.h"
-#include "CompatibilityOverride.h"
+#include "../CompatibilityOverride/CompatibilityOverride.h"
 #include "ImageInspection.h"
 #include <functional>
 #include <vector>
@@ -1284,6 +1284,10 @@ public:
   using BuiltTypeDecl = const ContextDescriptor *;
   using BuiltProtocolDecl = ProtocolDescriptorRef;
 
+  BuiltType decodeMangledType(NodePointer node) {
+    return Demangle::decodeMangledType(*this, node).getType();
+  }
+
   Demangle::NodeFactory &getNodeFactory() { return demangler; }
 
   TypeLookupErrorOr<BuiltType>
@@ -1463,7 +1467,7 @@ public:
     return BuiltType();
   }
 
-  TypeLookupErrorOr<BuiltType>
+  BuiltType
   createGenericTypeParameterType(unsigned depth, unsigned index) const {
     // Use the callback, when provided.
     if (substGenericParameter)
@@ -1473,8 +1477,13 @@ public:
   }
 
   TypeLookupErrorOr<BuiltType>
-  createFunctionType(llvm::ArrayRef<Demangle::FunctionParam<BuiltType>> params,
-                     BuiltType result, FunctionTypeFlags flags) const {
+  createFunctionType(
+      llvm::ArrayRef<Demangle::FunctionParam<BuiltType>> params,
+      BuiltType result, FunctionTypeFlags flags,
+      FunctionMetadataDifferentiabilityKind diffKind) const {
+    assert(
+        (flags.isDifferentiable() && diffKind.isDifferentiable()) ||
+        (!flags.isDifferentiable() && !diffKind.isDifferentiable()));
     llvm::SmallVector<BuiltType, 8> paramTypes;
     llvm::SmallVector<uint32_t, 8> paramFlags;
 
@@ -1488,11 +1497,15 @@ public:
         paramFlags.push_back(param.getFlags().getIntValue());
     }
 
-    return swift_getFunctionTypeMetadata(flags, paramTypes.data(),
-                                         flags.hasParameterFlags()
-                                           ? paramFlags.data()
-                                           : nullptr,
-                                         result);
+    return flags.isDifferentiable()
+        ? swift_getFunctionTypeMetadataDifferentiable(
+              flags, diffKind, paramTypes.data(),
+              flags.hasParameterFlags() ? paramFlags.data() : nullptr,
+              result)
+        : swift_getFunctionTypeMetadata(
+              flags, paramTypes.data(),
+              flags.hasParameterFlags() ? paramFlags.data() : nullptr,
+              result);
   }
 
   TypeLookupErrorOr<BuiltType> createImplFunctionType(
@@ -1560,6 +1573,67 @@ public:
   TypeLookupErrorOr<BuiltType> createSILBoxType(BuiltType base) const {
     // FIXME: Implement.
     return BuiltType();
+  }
+
+  using BuiltSILBoxField = llvm::PointerIntPair<BuiltType, 1>;
+  using BuiltSubstitution = std::pair<BuiltType, BuiltType>;
+  struct BuiltLayoutConstraint {
+    bool operator==(BuiltLayoutConstraint rhs) const { return true; }
+    operator bool() const { return true; }
+  };
+  using BuiltLayoutConstraint = BuiltLayoutConstraint;
+  BuiltLayoutConstraint getLayoutConstraint(LayoutConstraintKind kind) {
+    return {};
+  }
+  BuiltLayoutConstraint
+  getLayoutConstraintWithSizeAlign(LayoutConstraintKind kind, unsigned size,
+                                   unsigned alignment) {
+    return {};
+  }
+
+#if LLVM_PTR_SIZE == 4
+  /// Unfortunately the alignment of TypeRef is too large to squeeze in 3 extra
+  /// bits on (some?) 32-bit systems.
+  class BigBuiltTypeIntPair {
+    BuiltType Ptr;
+    RequirementKind Int;
+  public:
+    BigBuiltTypeIntPair(BuiltType ptr, RequirementKind i) : Ptr(ptr), Int(i) {}
+    RequirementKind getInt() const { return Int; }
+    BuiltType getPointer() const { return Ptr; }
+    uint64_t getOpaqueValue() const {
+      return (uint64_t)Ptr | ((uint64_t)Int << 32);
+    }
+  };
+#endif
+
+  struct Requirement : public RequirementBase<BuiltType,
+#if LLVM_PTR_SIZE == 4
+         BigBuiltTypeIntPair,
+#else
+         llvm::PointerIntPair<BuiltType, 3, RequirementKind>,
+
+#endif
+         BuiltLayoutConstraint> {
+    Requirement(RequirementKind kind, BuiltType first, BuiltType second)
+        : RequirementBase(kind, first, second) {}
+    Requirement(RequirementKind kind, BuiltType first,
+                BuiltLayoutConstraint second)
+        : RequirementBase(kind, first, second) {}
+  };
+  using BuiltRequirement = Requirement;
+
+  TypeLookupErrorOr<BuiltType> createSILBoxTypeWithLayout(
+      llvm::ArrayRef<BuiltSILBoxField> Fields,
+      llvm::ArrayRef<BuiltSubstitution> Substitutions,
+      llvm::ArrayRef<BuiltRequirement> Requirements) const {
+    // FIXME: Implement.
+    return BuiltType();
+  }
+
+  bool isExistential(BuiltType) {
+    // FIXME: Implement.
+    return true;
   }
 
   TypeReferenceOwnership getReferenceOwnership() const {
@@ -1883,7 +1957,7 @@ static void installGetClassHook() {
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunguarded-availability"
-  if (objc_setHook_getClass) {
+  if (&objc_setHook_getClass) {
     objc_setHook_getClass(getObjCClassByMangledName, &OldGetClassHook);
   }
 #pragma clang diagnostic pop
@@ -2439,4 +2513,4 @@ void swift::swift_disableDynamicReplacementScope(
   DynamicReplacementLock.get().withLock([=] { scope->disable(); });
 }
 #define OVERRIDE_METADATALOOKUP COMPATIBILITY_OVERRIDE
-#include "CompatibilityOverride.def"
+#include COMPATIBILITY_OVERRIDE_INCLUDE_PATH

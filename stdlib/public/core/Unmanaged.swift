@@ -240,3 +240,6 @@ public struct Unmanaged<Instance: AnyObject> {
   }
 #endif
 }
+
+extension Unmanaged: Sendable where Instance: Sendable { }
+

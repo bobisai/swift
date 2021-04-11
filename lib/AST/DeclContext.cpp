@@ -677,6 +677,19 @@ unsigned DeclContext::printContext(raw_ostream &OS, const unsigned indent,
       OS << " DefaultArgument index=" << init->getIndex();
       break;
     }
+    case InitializerKind::PropertyWrapper: {
+      auto init = cast<PropertyWrapperInitializer>(this);
+      OS << "PropertyWrapper 0x" << (void*)init->getParam() << ", kind=";
+      switch (init->getKind()) {
+      case PropertyWrapperInitializer::Kind::WrappedValue:
+        OS << "wrappedValue";
+        break;
+      case PropertyWrapperInitializer::Kind::ProjectedValue:
+          OS << "projectedValue";
+        break;
+      }
+      break;
+    }
     }
     break;
 
@@ -1058,16 +1071,14 @@ getPrivateDeclContext(const DeclContext *DC, const SourceFile *useSF) {
   return lastExtension ? lastExtension : DC;
 }
 
-AccessScope::AccessScope(const DeclContext *DC, bool isPrivate, bool isSPI)
-    : Value(DC, isPrivate || isSPI) {
+AccessScope::AccessScope(const DeclContext *DC, bool isPrivate)
+    : Value(DC, isPrivate) {
   if (isPrivate) {
     DC = getPrivateDeclContext(DC, DC->getParentSourceFile());
     Value.setPointer(DC);
   }
   if (!DC || isa<ModuleDecl>(DC))
     assert(!isPrivate && "public or internal scope can't be private");
-  if (DC)
-    assert(!isSPI && "only public scopes can be SPI");
 }
 
 bool AccessScope::isFileScope() const {
@@ -1177,7 +1188,9 @@ bool DeclContext::hasValueSemantics() const {
 bool DeclContext::isClassConstrainedProtocolExtension() const {
   if (getExtendedProtocolDecl()) {
     auto ED = cast<ExtensionDecl>(this);
-    return ED->getGenericSignature()->requiresClass(ED->getSelfInterfaceType());
+    if (auto sig = ED->getGenericSignature()) {
+      return sig->requiresClass(ED->getSelfInterfaceType());
+    }
   }
   return false;
 }

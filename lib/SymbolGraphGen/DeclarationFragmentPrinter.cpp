@@ -146,11 +146,17 @@ void DeclarationFragmentPrinter::printTypeRef(Type T, const TypeDecl *RefTo,
         ShouldLink = false;
       }
     }
+
+    if (T->isTypeParameter()) {
+      ShouldLink = false;
+    }
   }
 
   if (ShouldLink) {
     llvm::raw_svector_ostream OS(USR);
     ide::printDeclUSR(RefTo, OS);
+    if (ReferencedDecls)
+      ReferencedDecls->insert(RefTo);
   }
   closeFragment();
 }

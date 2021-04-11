@@ -1,7 +1,8 @@
-// RUN: %target-swift-frontend -emit-ir -swift-version 5 -O -primary-file %s | %FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-%target-ptrsize
+// RUN: %target-swift-frontend -emit-ir -swift-version 5 -O -enable-copy-propagation -primary-file %s | %FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-%target-ptrsize
 //
 // REQUIRES: VENDOR=apple
 // REQUIRES: swift_stdlib_no_asserts
+// REQUIRES: PTRSIZE=64
 
 // This tests the optimality of the IR generated for the new os log APIs. This
 // is not testing the output of a specific optimization pass (which has separate

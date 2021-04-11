@@ -50,6 +50,7 @@ set(CMAKE_CXX_EXTENSIONS NO)
 # First include general CMake utilities.
 include(SwiftUtils)
 include(CheckSymbolExists)
+include(CMakeDependentOption)
 
 #
 # User-configurable options that control the inclusion and default build
@@ -147,7 +148,7 @@ set(SWIFT_ANALYZE_CODE_COVERAGE FALSE CACHE STRING
 # SWIFT_VERSION is deliberately /not/ cached so that an existing build directory
 # can be reused when a new version of Swift comes out (assuming the user hasn't
 # manually set it as part of their own CMake configuration).
-set(SWIFT_VERSION "5.4")
+set(SWIFT_VERSION "5.5")
 
 set(SWIFT_VENDOR "" CACHE STRING
     "The vendor name of the Swift compiler")
@@ -170,6 +171,9 @@ else()
 endif()
 set(SWIFT_USE_LINKER ${SWIFT_USE_LINKER_default} CACHE STRING
     "Build Swift with a non-default linker")
+
+option(SWIFT_DISABLE_DEAD_STRIPPING 
+      "Turn off Darwin-specific dead stripping for Swift host tools." FALSE)
 
 set(SWIFT_TOOLS_ENABLE_LTO OFF CACHE STRING "Build Swift tools with LTO. One
     must specify the form of LTO by setting this to one of: 'full', 'thin'. This
@@ -336,10 +340,6 @@ set(SWIFT_DARWIN_DEPLOYMENT_VERSION_WATCHOS "2.0" CACHE STRING
 # User-configurable debugging options.
 #
 
-option(SWIFT_AST_VERIFIER
-    "Enable the AST verifier in the built compiler, and run it on every compilation"
-    TRUE)
-
 option(SWIFT_SIL_VERIFY_ALL
     "Run SIL verification after each transform when building Swift files in the build process"
     FALSE)
@@ -407,6 +407,24 @@ option(SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY
   "Enable experimental Swift concurrency model"
   FALSE)
 
+option(SWIFT_ENABLE_DISPATCH
+  "Enable use of libdispatch"
+  TRUE)
+
+cmake_dependent_option(SWIFT_BUILD_SYNTAXPARSERLIB
+  "Build the Swift Syntax Parser library" TRUE
+  "SWIFT_ENABLE_DISPATCH" FALSE)
+cmake_dependent_option(SWIFT_BUILD_ONLY_SYNTAXPARSERLIB
+  "Only build the Swift Syntax Parser library" FALSE
+  "SWIFT_BUILD_SYNTAXPARSERLIB" FALSE)
+
+cmake_dependent_option(SWIFT_BUILD_SOURCEKIT
+  "Build SourceKit" TRUE
+  "SWIFT_ENABLE_DISPATCH" FALSE)
+cmake_dependent_option(SWIFT_ENABLE_SOURCEKIT_TESTS
+  "Enable running SourceKit tests" TRUE
+  "SWIFT_BUILD_SOURCEKIT" FALSE)
+
 #
 # End of user-configurable options.
 #
@@ -430,11 +448,6 @@ if(CMAKE_C_COMPILER_ID MATCHES Clang)
   add_compile_options($<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-Werror=gnu>)
 endif()
 
-option(SWIFT_BUILD_SYNTAXPARSERLIB "Build the Swift Syntax Parser library" TRUE)
-option(SWIFT_BUILD_ONLY_SYNTAXPARSERLIB "Only build the Swift Syntax Parser library" FALSE)
-option(SWIFT_BUILD_SOURCEKIT "Build SourceKit" TRUE)
-option(SWIFT_ENABLE_SOURCEKIT_TESTS "Enable running SourceKit tests" ${SWIFT_BUILD_SOURCEKIT})
-
 # Use dispatch as the system scheduler by default.
 # For convenience, we set this to false when concurrency is disabled.
 set(SWIFT_CONCURRENCY_USES_DISPATCH FALSE)
@@ -443,14 +456,12 @@ if(SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY AND NOT SWIFT_STDLIB_SINGLE_THREADED_RU
 endif()
 
 set(SWIFT_BUILD_HOST_DISPATCH FALSE)
-if(SWIFT_BUILD_SYNTAXPARSERLIB OR SWIFT_BUILD_SOURCEKIT)
-  if(NOT CMAKE_SYSTEM_NAME STREQUAL Darwin)
+if(SWIFT_ENABLE_DISPATCH AND NOT CMAKE_SYSTEM_NAME STREQUAL Darwin)
+  if(SWIFT_BUILD_SYNTAXPARSERLIB OR SWIFT_BUILD_SOURCEKIT)
     set(SWIFT_BUILD_HOST_DISPATCH TRUE)
   endif()
-endif()
 
-if(SWIFT_BUILD_HOST_DISPATCH OR SWIFT_CONCURRENCY_USES_DISPATCH)
-  if(NOT CMAKE_SYSTEM_NAME STREQUAL Darwin)
+  if(SWIFT_BUILD_HOST_DISPATCH OR SWIFT_CONCURRENCY_USES_DISPATCH)
     if(NOT EXISTS "${SWIFT_PATH_TO_LIBDISPATCH_SOURCE}")
       message(SEND_ERROR "SyntaxParserLib, SourceKit, and concurrency require libdispatch on non-Darwin hosts.  Please specify SWIFT_PATH_TO_LIBDISPATCH_SOURCE")
     endif()
@@ -962,132 +973,8 @@ if (LLVM_ENABLE_DOXYGEN)
   message(STATUS "Doxygen: enabled")
 endif()
 
-if(SWIFT_BUILD_HOST_DISPATCH)
-  if(NOT CMAKE_SYSTEM_NAME STREQUAL Darwin)
-    if(CMAKE_C_COMPILER_ID STREQUAL Clang AND
-       CMAKE_C_COMPILER_VERSION VERSION_GREATER 3.8
-       OR LLVM_USE_SANITIZER)
-      set(SWIFT_LIBDISPATCH_C_COMPILER ${CMAKE_C_COMPILER})
-      set(SWIFT_LIBDISPATCH_CXX_COMPILER ${CMAKE_CXX_COMPILER})
-    elseif(${CMAKE_SYSTEM_NAME} STREQUAL ${CMAKE_HOST_SYSTEM_NAME})
-      if(CMAKE_SYSTEM_NAME STREQUAL Windows)
-        if(CMAKE_SYSTEM_PROCESSOR STREQUAL CMAKE_HOST_SYSTEM_PROCESSOR AND
-            TARGET clang)
-          set(SWIFT_LIBDISPATCH_C_COMPILER
-              $<TARGET_FILE_DIR:clang>/clang-cl${CMAKE_EXECUTABLE_SUFFIX})
-          set(SWIFT_LIBDISPATCH_CXX_COMPILER
-              $<TARGET_FILE_DIR:clang>/clang-cl${CMAKE_EXECUTABLE_SUFFIX})
-        else()
-          set(SWIFT_LIBDISPATCH_C_COMPILER clang-cl${CMAKE_EXECUTABLE_SUFFIX})
-          set(SWIFT_LIBDISPATCH_CXX_COMPILER clang-cl${CMAKE_EXECUTABLE_SUFFIX})
-        endif()
-      else()
-        set(SWIFT_LIBDISPATCH_C_COMPILER $<TARGET_FILE_DIR:clang>/clang)
-        set(SWIFT_LIBDISPATCH_CXX_COMPILER $<TARGET_FILE_DIR:clang>/clang++)
-      endif()
-    else()
-      message(SEND_ERROR "libdispatch requires a newer clang compiler (${CMAKE_C_COMPILER_VERSION} < 3.9)")
-    endif()
-
-    if(SWIFT_HOST_VARIANT_SDK STREQUAL WINDOWS)
-      set(SOURCEKIT_LIBDISPATCH_RUNTIME_DIR bin)
-    else()
-      set(SOURCEKIT_LIBDISPATCH_RUNTIME_DIR lib)
-    endif()
-
-    include(ExternalProject)
-    ExternalProject_Add(libdispatch
-                        SOURCE_DIR
-                          "${SWIFT_PATH_TO_LIBDISPATCH_SOURCE}"
-                        CMAKE_ARGS
-                          -DCMAKE_AR=${CMAKE_AR}
-                          -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-                          -DCMAKE_C_COMPILER=${SWIFT_LIBDISPATCH_C_COMPILER}
-                          -DCMAKE_C_FLAGS=${CMAKE_C_FLAGS}
-                          -DCMAKE_CXX_COMPILER=${SWIFT_LIBDISPATCH_CXX_COMPILER}
-                          -DCMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}
-                          -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}
-                          -DCMAKE_INSTALL_LIBDIR=lib
-                          -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
-                          -DCMAKE_LINKER=${CMAKE_LINKER}
-                          -DCMAKE_RANLIB=${CMAKE_RANLIB}
-                          -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
-                          -DBUILD_SHARED_LIBS=YES
-                          -DENABLE_SWIFT=NO
-                          -DENABLE_TESTING=NO
-                        INSTALL_COMMAND
-                          # NOTE(compnerd) provide a custom install command to
-                          # ensure that we strip out the DESTDIR environment
-                          # from the sub-build
-                          ${CMAKE_COMMAND} -E env --unset=DESTDIR ${CMAKE_COMMAND} --build . --target install
-                        STEP_TARGETS
-                          install
-                        BUILD_BYPRODUCTS
-                          <INSTALL_DIR>/${SOURCEKIT_LIBDISPATCH_RUNTIME_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}dispatch${CMAKE_SHARED_LIBRARY_SUFFIX}
-                          <INSTALL_DIR>/lib/${CMAKE_IMPORT_LIBRARY_PREFIX}dispatch${CMAKE_IMPORT_LIBRARY_SUFFIX}
-                          <INSTALL_DIR>/${SOURCEKIT_LIBDISPATCH_RUNTIME_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}BlocksRuntime${CMAKE_SHARED_LIBRARY_SUFFIX}
-                          <INSTALL_DIR>/lib/${CMAKE_IMPORT_LIBRARY_PREFIX}BlocksRuntime${CMAKE_IMPORT_LIBRARY_SUFFIX}
-                        BUILD_ALWAYS
-                          1)
-
-    ExternalProject_Get_Property(libdispatch install_dir)
-
-    # CMake does not like the addition of INTERFACE_INCLUDE_DIRECTORIES without
-    # the directory existing.  Just create the location which will be populated
-    # during the installation.
-    file(MAKE_DIRECTORY ${install_dir}/include)
-
-    add_library(dispatch SHARED IMPORTED)
-    set_target_properties(dispatch
-                          PROPERTIES
-                            IMPORTED_LOCATION
-                              ${install_dir}/${SOURCEKIT_LIBDISPATCH_RUNTIME_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}dispatch${CMAKE_SHARED_LIBRARY_SUFFIX}
-                            IMPORTED_IMPLIB
-                              ${install_dir}/lib/${CMAKE_IMPORT_LIBRARY_PREFIX}dispatch${CMAKE_IMPORT_LIBRARY_SUFFIX}
-                            INTERFACE_INCLUDE_DIRECTORIES
-                              ${install_dir}/include)
-
-    add_library(BlocksRuntime SHARED IMPORTED)
-    set_target_properties(BlocksRuntime
-                          PROPERTIES
-                            IMPORTED_LOCATION
-                              ${install_dir}/${SOURCEKIT_LIBDISPATCH_RUNTIME_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}BlocksRuntime${CMAKE_SHARED_LIBRARY_SUFFIX}
-                            IMPORTED_IMPLIB
-                              ${install_dir}/lib/${CMAKE_IMPORT_LIBRARY_PREFIX}BlocksRuntime${CMAKE_IMPORT_LIBRARY_SUFFIX}
-                            INTERFACE_INCLUDE_DIRECTORIES
-                              ${SWIFT_PATH_TO_LIBDISPATCH_SOURCE}/src/BlocksRuntime)
-
-    add_dependencies(dispatch libdispatch-install)
-    add_dependencies(BlocksRuntime libdispatch-install)
-
-    if(SWIFT_HOST_VARIANT_SDK STREQUAL WINDOWS)
-      set(SOURCEKIT_RUNTIME_DIR bin)
-    else()
-      set(SOURCEKIT_RUNTIME_DIR lib)
-    endif()
-    add_dependencies(sourcekit-inproc BlocksRuntime dispatch)
-    if("${SWIFT_HOST_VARIANT_SDK}" MATCHES "OSX|WINDOWS")
-      swift_install_in_component(FILES
-                                   $<TARGET_FILE:dispatch>
-                                   $<TARGET_FILE:BlocksRuntime>
-                                 DESTINATION ${SOURCEKIT_RUNTIME_DIR}
-                                 COMPONENT sourcekit-inproc)
-    endif()
-    if(SWIFT_HOST_VARIANT_SDK STREQUAL WINDOWS)
-      swift_install_in_component(FILES
-                                   $<TARGET_LINKER_FILE:dispatch>
-                                   $<TARGET_LINKER_FILE:BlocksRuntime>
-                                 DESTINATION lib
-                                 COMPONENT sourcekit-inproc)
-    endif()
-
-
-    # FIXME(compnerd) this should be taken care of by the
-    # INTERFACE_INCLUDE_DIRECTORIES above
-    include_directories(AFTER
-                          ${SWIFT_PATH_TO_LIBDISPATCH_SOURCE}/src/BlocksRuntime
-                          ${SWIFT_PATH_TO_LIBDISPATCH_SOURCE})
-  endif()
+if(SWIFT_ENABLE_DISPATCH)
+  include(Libdispatch)
 endif()
 
 # Add all of the subdirectories, where we actually do work.

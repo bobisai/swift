@@ -70,6 +70,10 @@ function(_add_target_variant_c_compile_link_flags)
     endif()
   endif()
 
+  if("${CFLAGS_SDK}" STREQUAL "ANDROID")
+    set(DEPLOYMENT_VERSION ${SWIFT_ANDROID_API_LEVEL})
+  endif()
+
   # MSVC, clang-cl, gcc don't understand -target.
   if(CMAKE_C_COMPILER_ID MATCHES "^Clang|AppleClang$" AND
       NOT SWIFT_COMPILER_IS_MSVC_LIKE)
@@ -279,16 +283,6 @@ function(_add_target_variant_c_compile_flags)
      list(APPEND result -funwind-tables)
   endif()
 
-  if("${CFLAGS_SDK}" STREQUAL "ANDROID")
-    list(APPEND result -nostdinc++)
-    swift_android_libcxx_include_paths(CFLAGS_CXX_INCLUDES)
-    swift_android_include_for_arch("${CFLAGS_ARCH}" "${CFLAGS_ARCH}_INCLUDE")
-    foreach(path IN LISTS CFLAGS_CXX_INCLUDES ${CFLAGS_ARCH}_INCLUDE)
-      list(APPEND result "SHELL:${CMAKE_INCLUDE_SYSTEM_FLAG_C}${path}")
-    endforeach()
-    list(APPEND result "-D__ANDROID_API__=${SWIFT_ANDROID_API_LEVEL}")
-  endif()
-
   if("${CFLAGS_SDK}" STREQUAL "LINUX")
     if(${CFLAGS_ARCH} STREQUAL x86_64)
       # this is the minimum architecture that supports 16 byte CAS, which is necessary to avoid a dependency to libatomic
@@ -364,6 +358,9 @@ function(_add_target_variant_link_flags)
     MACCATALYST_BUILD_FLAVOR  "${LFLAGS_MACCATALYST_BUILD_FLAVOR}")
   if("${LFLAGS_SDK}" STREQUAL "LINUX")
     list(APPEND link_libraries "pthread" "dl")
+    if("${SWIFT_HOST_VARIANT_ARCH}" MATCHES "armv6|armv7|i686")
+      list(APPEND link_libraries PRIVATE "atomic")
+    endif()
   elseif("${LFLAGS_SDK}" STREQUAL "FREEBSD")
     list(APPEND link_libraries "pthread")
   elseif("${LFLAGS_SDK}" STREQUAL "OPENBSD")
@@ -401,7 +398,7 @@ function(_add_target_variant_link_flags)
       ${SWIFT_ANDROID_${LFLAGS_ARCH}_ICU_I18N}
       ${SWIFT_ANDROID_${LFLAGS_ARCH}_ICU_UC})
 
-    swift_android_lib_for_arch(${LFLAGS_ARCH} ${LFLAGS_ARCH}_LIB)
+    swift_android_libgcc_for_arch_cross_compile(${LFLAGS_ARCH} ${LFLAGS_ARCH}_LIB)
     foreach(path IN LISTS ${LFLAGS_ARCH}_LIB)
       list(APPEND library_search_directories ${path})
     endforeach()
@@ -629,7 +626,8 @@ function(_add_swift_target_library_single target name)
         DARWIN_INSTALL_NAME_DIR
         SDK
         DEPLOYMENT_VERSION_MACCATALYST
-        MACCATALYST_BUILD_FLAVOR)
+        MACCATALYST_BUILD_FLAVOR
+        ENABLE_LTO)
   set(SWIFTLIB_SINGLE_multiple_parameter_options
         C_COMPILE_FLAGS
         DEPENDS
@@ -784,6 +782,7 @@ function(_add_swift_target_library_single target name)
       ${SWIFTLIB_SINGLE_IS_SDK_OVERLAY_keyword}
       ${embed_bitcode_arg}
       ${SWIFTLIB_SINGLE_STATIC_keyword}
+      ENABLE_LTO "${SWIFTLIB_SINGLE_ENABLE_LTO}"
       INSTALL_IN_COMPONENT "${SWIFTLIB_SINGLE_INSTALL_IN_COMPONENT}"
       MACCATALYST_BUILD_FLAVOR "${SWIFTLIB_SINGLE_MACCATALYST_BUILD_FLAVOR}")
   add_swift_source_group("${SWIFTLIB_SINGLE_EXTERNAL_SOURCES}")
@@ -1145,7 +1144,7 @@ function(_add_swift_target_library_single target name)
   endif()
 
   if (NOT SWIFTLIB_SINGLE_TARGET_LIBRARY)
-    set(lto_type "${SWIFT_TOOLS_ENABLE_LTO}")
+    set(lto_type "${SWIFT_STDLIB_ENABLE_LTO}")
   endif()
 
   _add_target_variant_c_compile_flags(
@@ -1994,7 +1993,7 @@ function(add_swift_target_library name)
         DEPLOYMENT_VERSION_TVOS "${SWIFTLIB_DEPLOYMENT_VERSION_TVOS}"
         DEPLOYMENT_VERSION_WATCHOS "${SWIFTLIB_DEPLOYMENT_VERSION_WATCHOS}"
         MACCATALYST_BUILD_FLAVOR "${maccatalyst_build_flavor}"
-
+        ENABLE_LTO "${SWIFT_STDLIB_ENABLE_LTO}"
         GYB_SOURCES ${SWIFTLIB_GYB_SOURCES}
       )
     if(NOT SWIFT_BUILT_STANDALONE AND NOT "${CMAKE_C_COMPILER_ID}" MATCHES "Clang")
@@ -2018,7 +2017,9 @@ function(add_swift_target_library name)
       if(NOT SWIFTLIB_OBJECT_LIBRARY)
         # Add dependencies on the (not-yet-created) custom lipo target.
         foreach(DEP ${SWIFTLIB_LINK_LIBRARIES})
-          if (NOT "${DEP}" STREQUAL "icucore")
+          if (NOT "${DEP}" STREQUAL "icucore" AND
+              NOT "${DEP}" STREQUAL "dispatch" AND
+              NOT "${DEP}" STREQUAL "BlocksRuntime")
             add_dependencies(${VARIANT_NAME}
               "${DEP}-${SWIFT_SDK_${sdk}_LIB_SUBDIR}")
           endif()
@@ -2027,7 +2028,9 @@ function(add_swift_target_library name)
         if (SWIFTLIB_IS_STDLIB AND SWIFTLIB_STATIC)
           # Add dependencies on the (not-yet-created) custom lipo target.
           foreach(DEP ${SWIFTLIB_LINK_LIBRARIES})
-            if (NOT "${DEP}" STREQUAL "icucore")
+            if (NOT "${DEP}" STREQUAL "icucore" AND
+                NOT "${DEP}" STREQUAL "dispatch" AND
+                NOT "${DEP}" STREQUAL "BlocksRuntime")
               add_dependencies("${VARIANT_NAME}-static"
                 "${DEP}-${SWIFT_SDK_${sdk}_LIB_SUBDIR}-static")
             endif()
@@ -2324,7 +2327,7 @@ function(_add_swift_target_executable_single name)
     ARCH "${SWIFTEXE_SINGLE_ARCHITECTURE}"
     BUILD_TYPE "${CMAKE_BUILD_TYPE}"
     ENABLE_ASSERTIONS "${LLVM_ENABLE_ASSERTIONS}"
-    ENABLE_LTO "${SWIFT_TOOLS_ENABLE_LTO}"
+    ENABLE_LTO "${SWIFT_STDLIB_ENABLE_LTO}"
     ANALYZE_CODE_COVERAGE "${SWIFT_ANALYZE_CODE_COVERAGE}"
     RESULT_VAR_NAME c_compile_flags)
   _add_target_variant_link_flags(
@@ -2332,7 +2335,7 @@ function(_add_swift_target_executable_single name)
     ARCH "${SWIFTEXE_SINGLE_ARCHITECTURE}"
     BUILD_TYPE "${CMAKE_BUILD_TYPE}"
     ENABLE_ASSERTIONS "${LLVM_ENABLE_ASSERTIONS}"
-    ENABLE_LTO "${SWIFT_TOOLS_ENABLE_LTO}"
+    ENABLE_LTO "${SWIFT_STDLIB_ENABLE_LTO}"
     LTO_OBJECT_NAME "${name}-${SWIFTEXE_SINGLE_SDK}-${SWIFTEXE_SINGLE_ARCHITECTURE}"
     ANALYZE_CODE_COVERAGE "${SWIFT_ANALYZE_CODE_COVERAGE}"
     RESULT_VAR_NAME link_flags
@@ -2352,6 +2355,7 @@ function(_add_swift_target_executable_single name)
       SDK ${SWIFTEXE_SINGLE_SDK}
       ARCHITECTURE ${SWIFTEXE_SINGLE_ARCHITECTURE}
       COMPILE_FLAGS ${SWIFTEXE_SINGLE_COMPILE_FLAGS}
+      ENABLE_LTO "${SWIFT_STDLIB_ENABLE_LTO}"
       IS_MAIN)
   add_swift_source_group("${SWIFTEXE_SINGLE_EXTERNAL_SOURCES}")
 

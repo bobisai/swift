@@ -101,6 +101,8 @@ def tbd_is_installapi: Flag<["-"], "tbd-is-installapi">,
 def verify : Flag<["-"], "verify">,
   HelpText<"Verify diagnostics against expected-{error|warning|note} "
            "annotations">;
+def verify_additional_file : Separate<["-"], "verify-additional-file">,
+  HelpText<"Verify diagnostics in this file in addition to source files">;
 def verify_apply_fixes : Flag<["-"], "verify-apply-fixes">,
   HelpText<"Like -verify, but updates the original source file">;
 def verify_ignore_unknown: Flag<["-"], "verify-ignore-unknown">,
@@ -186,6 +188,17 @@ def batch_scan_input_file
 def import_prescan : Flag<["-"], "import-prescan">,
    HelpText<"When performing a dependency scan, only dentify all imports of the main Swift module sources">;
 
+def enable_copy_propagation : Flag<["-"], "enable-copy-propagation">,
+  HelpText<"Run SIL copy propagation to shorten object lifetime.">;
+def disable_copy_propagation : Flag<["-"], "disable-copy-propagation">,
+  HelpText<"Don't run SIL copy propagation to preserve object lifetime.">;
+
+def enable_infer_public_concurrent_value : Flag<["-"], "enable-infer-public-sendable">,
+    HelpText<"Enable inference of Sendable conformances for public structs and enums">;
+
+def disable_infer_public_concurrent_value : Flag<["-"], "disable-infer-public-sendable">,
+    HelpText<"Disable inference of Sendable conformances for public structs and enums">;
+
 } // end let Flags = [FrontendOption, NoDriverOption]
 
 def debug_crash_Group : OptionGroup<"<automatic crashing options>">;
@@ -212,14 +225,19 @@ let Flags = [FrontendOption, NoDriverOption, HelpHidden, ModuleInterfaceOption] 
     HelpText<"Disable requiring uses of @objc to require importing the "
              "Foundation module">;
 
-  def enable_experimental_prespecialization :
-    Flag<["-"], "enable-experimental-prespecialization">,
-    HelpText<"Enable experimental pre-specialization support">;
-
 def enable_experimental_concurrency :
   Flag<["-"], "enable-experimental-concurrency">,
   HelpText<"Enable experimental concurrency model">;
-  def enable_resilience : Flag<["-"], "enable-resilience">,
+
+def enable_experimental_async_handler :
+  Flag<["-"], "enable-experimental-async-handler">,
+  HelpText<"Enable experimental @asyncHandler feature">;
+
+def enable_experimental_flow_sensitive_concurrent_captures :
+  Flag<["-"], "enable-experimental-flow-sensitive-concurrent-captures">,
+  HelpText<"Enable flow-sensitive concurrent captures">;
+
+def enable_resilience : Flag<["-"], "enable-resilience">,
      HelpText<"Deprecated, use -enable-library-evolution instead">;
 }
 
@@ -399,9 +417,8 @@ def disable_conformance_availability_errors : Flag<["-"],
   "disable-conformance-availability-errors">,
   HelpText<"Diagnose conformance availability violations as warnings">;
 
-def enable_infer_import_as_member :
-  Flag<["-"], "enable-infer-import-as-member">,
-  HelpText<"Infer when a global could be imported as a member">;
+def report_errors_to_debugger : Flag<["-"], "report-errors-to-debugger">,
+  HelpText<"Deprecated, will be removed in future versions.">;
 
 def enable_swift3_objc_inference : Flag<["-"], "enable-swift3-objc-inference">,
   Flags<[FrontendOption, HelpHidden]>,
@@ -411,6 +428,11 @@ def disable_swift3_objc_inference :
   Flag<["-"], "disable-swift3-objc-inference">,
   Flags<[FrontendOption, HelpHidden]>,
   HelpText<"Disable Swift 3's @objc inference rules for NSObject-derived classes and 'dynamic' members (emulates Swift 4 behavior)">;
+
+def library_level : Separate<["-"], "library-level">,
+  MetaVarName<"<level>">,
+  Flags<[FrontendOption]>,
+  HelpText<"Library distribution level 'api', 'spi' or 'other' (the default)">;
 
 def enable_implicit_dynamic : Flag<["-"], "enable-implicit-dynamic">,
   Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
@@ -623,6 +645,9 @@ def index_ignore_stdlib :
   Flag<["-"], "index-ignore-stdlib">,
   HelpText<"Avoid emitting index data for the standard library.">;
 
+def index_unit_output_path_filelist : Separate<["-"], "index-unit-output-path-filelist">,
+  HelpText<"Specify index unit output paths in a file rather than on the command line">;
+
 def dump_interface_hash : Flag<["-"], "dump-interface-hash">,
    HelpText<"Parse input file(s) and dump interface token hash(es)">,
    ModeOpt;
@@ -733,6 +758,9 @@ def disable_interface_lockfile : Flag<["-"], "disable-interface-lock">,
 def bridging_header_directory_for_print: Separate<["-"], "bridging-header-directory-for-print">, MetaVarName<"<path>">,
     HelpText<"Directory for bridging header to be printed in compatibility header">;
 
+def entry_point_function_name: Separate<["-"], "entry-point-function-name">, MetaVarName<"<string>">, 
+    HelpText<"Name of the entry point function">;
+
 def target_sdk_version : Separate<["-"], "target-sdk-version">,
   HelpText<"The version of target SDK used for compilation">;
 
@@ -767,4 +795,28 @@ def bad_file_descriptor_retry_count:
   Separate<["-"], "bad-file-descriptor-retry-count">,
   HelpText<"Number of retrying opening a file if previous open returns a bad "
            "file descriptor error.">;
+
+def enable_ast_verifier : Flag<["-"], "enable-ast-verifier">,
+  HelpText<"Run the AST verifier during compilation. NOTE: This lets the user "
+           "override the default behavior on whether or not the ASTVerifier "
+           "is run. The default behavior is to run the verifier when asserts "
+           "are enabled and not run it when asserts are disabled. NOTE: "
+           "Can not be used if disable-ast-verifier is used as well">;
+
+def disable_ast_verifier : Flag<["-"], "disable-ast-verifier">,
+  HelpText<"Do not run the AST verifier during compilation. NOTE: This lets "
+           "the user override the default behavior on whether or not the "
+           "ASTVerifier is run. The default behavior is to run the verifier "
+           "when asserts are enabled and not run it when asserts are "
+           "disabled. NOTE: Can not be used if enable-ast-verifier is used "
+           "as well">;
+
+def enable_ossa_modules : Flag<["-"], "enable-ossa-modules">,
+  HelpText<"Always serialize SIL in ossa form. If this flag is not passed in, "
+           "when optimizing ownership will be lowered before serializing SIL">;
+
+def new_driver_path
+  : Separate<["-"], "new-driver-path">, MetaVarName<"<path>">,
+  HelpText<"Path of the new driver to be used">;
+
 } // end let Flags = [FrontendOption, NoDriverOption, HelpHidden]

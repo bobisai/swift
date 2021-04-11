@@ -82,12 +82,9 @@ UnitTestSourceFileDepGraphFactory::computeUseKey(StringRef s,
   if (!s.empty())
     return parseADefinedDecl(s, kindOfUse, aspectOfUse).getValue();
   StringRef swiftDepsRef(swiftDeps);
-  return DependencyKey(
-      NodeKind::sourceFileProvide, aspectOfUse,
-      DependencyKey::computeContextForProvidedEntity<
-          NodeKind::sourceFileProvide>(swiftDepsRef),
-      DependencyKey::computeNameForProvidedEntity<NodeKind::sourceFileProvide>(
-          swiftDepsRef));
+  return DependencyKey::Builder(NodeKind::sourceFileProvide, aspectOfUse)
+          .withName(swiftDepsRef)
+          .build();
 }
 
 //==============================================================================
@@ -143,7 +140,6 @@ UnitTestSourceFileDepGraphFactory::singleNameIsContext(const NodeKind kind) {
     return true;
   case NodeKind::topLevel:
   case NodeKind::dynamicLookup:
-  case NodeKind::incrementalExternalDepend:
   case NodeKind::externalDepend:
   case NodeKind::sourceFileProvide:
     return false;

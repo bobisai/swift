@@ -26,6 +26,7 @@
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
+#include "swift/SIL/BasicBlockBits.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
@@ -484,7 +485,7 @@ static bool matchSwitch(SwitchInfo &SI, SILInstruction *Inst,
 
   // Check that we call the _unconditionallyBridgeFromObjectiveC witness.
   auto NativeType = Apply->getType().getASTType();
-  auto *BridgeFun = FunRef->getInitiallyReferencedFunction();
+  auto *BridgeFun = FunRef->getReferencedFunction();
   auto *SwiftModule = BridgeFun->getModule().getSwiftModule();
   // Not every type conforms to the ObjectiveCBridgeable protocol in such a case
   // getBridgeFromObjectiveC returns SILDeclRef().
@@ -820,7 +821,7 @@ BridgedArgument BridgedArgument::match(unsigned ArgIdx, SILValue Arg,
 
   // Make sure we are calling the actual bridge witness.
   auto NativeType = BridgedValue->getType().getASTType();
-  auto *BridgeFun = FunRef->getInitiallyReferencedFunction();
+  auto *BridgeFun = FunRef->getReferencedFunction();
   auto *SwiftModule = BridgeFun->getModule().getSwiftModule();
   // Not every type conforms to the ObjectiveCBridgeable protocol in such a case
   // getBridgeToObjectiveC returns SILDeclRef().
@@ -1233,18 +1234,12 @@ public:
 /// functions.
 bool tryOutline(SILOptFunctionBuilder &FuncBuilder, SILFunction *Fun,
                 SmallVectorImpl<SILFunction *> &FunctionsAdded) {
-  SmallPtrSet<SILBasicBlock *, 32> Visited;
-  SmallVector<SILBasicBlock *, 128> Worklist;
+  BasicBlockWorklist<128> Worklist(Fun->getEntryBlock());
   OutlinePatterns patterns(FuncBuilder);
   bool changed = false;
 
   // Traverse the function.
-  Worklist.push_back(&*Fun->begin());
-  while (!Worklist.empty()) {
-
-    SILBasicBlock *CurBlock = Worklist.pop_back_val();
-    if (!Visited.insert(CurBlock).second) continue;
-
+  while (SILBasicBlock *CurBlock = Worklist.pop()) {
     SILBasicBlock::iterator CurInst = CurBlock->begin();
 
     // Go over the instructions trying to match and replace patterns.
@@ -1259,8 +1254,9 @@ bool tryOutline(SILOptFunctionBuilder &FuncBuilder, SILFunction *Fun,
          assert(LastInst->getParent() == CurBlock);
          changed = true;
        } else if (isa<TermInst>(CurInst)) {
-         std::copy(CurBlock->succ_begin(), CurBlock->succ_end(),
-                   std::back_inserter(Worklist));
+         for (SILBasicBlock *succ : CurBlock->getSuccessors()) {
+           Worklist.pushIfNotVisited(succ);
+         }
          ++CurInst;
        } else {
          ++CurInst;
@@ -1289,7 +1285,7 @@ public:
 
     // Dump function if requested.
     if (DumpFuncsBeforeOutliner.size() &&
-        Fun->getName().find(DumpFuncsBeforeOutliner, 0) != StringRef::npos) {
+        Fun->getName().contains(DumpFuncsBeforeOutliner)) {
       Fun->dump();
     }
 

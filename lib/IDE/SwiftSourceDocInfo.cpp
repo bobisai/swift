@@ -91,9 +91,8 @@ std::vector<ResolvedLoc> NameMatcher::resolve(ArrayRef<UnresolvedLoc> Locs, Arra
 
   // Add the locs themselves
   LocsToResolve.clear();
-  std::transform(MapToOriginalIndex.begin(), MapToOriginalIndex.end(),
-                 std::back_inserter(LocsToResolve),
-                 [&](size_t index){ return Locs[index]; });
+  llvm::transform(MapToOriginalIndex, std::back_inserter(LocsToResolve),
+                  [&](size_t index) { return Locs[index]; });
 
   InactiveConfigRegionNestings = 0;
   SelectorNestings = 0;
@@ -199,7 +198,7 @@ bool NameMatcher::handleCustomAttrs(Decl *D) {
 
 bool NameMatcher::walkToDeclPre(Decl *D) {
   // Handle occurrences in any preceding doc comments
-  RawComment R = D->getRawComment();
+  RawComment R = D->getRawComment(/*SerializedOK=*/false);
   if (!R.isEmpty()) {
     for(SingleRawComment C: R.Comments) {
       while(!shouldSkip(C.Range))
@@ -424,6 +423,36 @@ std::pair<bool, Expr*> NameMatcher::walkToExprPre(Expr *E) {
         if (!walkToExprPost(E))
           return {false, nullptr};
         return {false, E};
+      }
+      case ExprKind::KeyPath: {
+        KeyPathExpr *KP = cast<KeyPathExpr>(E);
+
+        // Swift keypath components are visited already, so there's no need to
+        // handle them specially.
+        if (!KP->isObjC())
+          break;
+
+        for (auto Component: KP->getComponents()) {
+          switch (Component.getKind()) {
+          case KeyPathExpr::Component::Kind::UnresolvedProperty:
+          case KeyPathExpr::Component::Kind::Property:
+            tryResolve(ASTWalker::ParentTy(E), Component.getLoc());
+            break;
+          case KeyPathExpr::Component::Kind::DictionaryKey:
+          case KeyPathExpr::Component::Kind::Invalid:
+            break;
+          case KeyPathExpr::Component::Kind::OptionalForce:
+          case KeyPathExpr::Component::Kind::OptionalChain:
+          case KeyPathExpr::Component::Kind::OptionalWrap:
+          case KeyPathExpr::Component::Kind::UnresolvedSubscript:
+          case KeyPathExpr::Component::Kind::Subscript:
+          case KeyPathExpr::Component::Kind::Identity:
+          case KeyPathExpr::Component::Kind::TupleElement:
+            llvm_unreachable("Unexpected component in ObjC KeyPath expression");
+            break;
+          }
+        }
+        break;
       }
       default: // ignored
         break;
@@ -918,7 +947,7 @@ getCallArgLabelRanges(SourceManager &SM, Expr *Arg, LabelRangeEndAt EndKind) {
   if (I != InfoVec.end())
     FirstTrailing = std::distance(InfoVec.begin(), I);
 
-  std::transform(InfoVec.begin(), InfoVec.end(), std::back_inserter(Ranges),
-                 [](CallArgInfo &Info) { return Info.LabelRange; });
+  llvm::transform(InfoVec, std::back_inserter(Ranges),
+                  [](CallArgInfo &Info) { return Info.LabelRange; });
   return {Ranges, FirstTrailing};
 }

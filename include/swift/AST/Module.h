@@ -17,6 +17,7 @@
 #ifndef SWIFT_MODULE_H
 #define SWIFT_MODULE_H
 
+#include "swift/AST/AccessNotes.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DeclContext.h"
 #include "swift/AST/Identifier.h"
@@ -55,6 +56,7 @@ namespace swift {
   class FileUnit;
   class FuncDecl;
   class InfixOperatorDecl;
+  enum class LibraryLevel : uint8_t;
   class LinkLibrary;
   class ModuleLoader;
   class NominalTypeDecl;
@@ -165,6 +167,9 @@ class ModuleDecl : public DeclContext, public TypeDecl {
   friend class DirectOperatorLookupRequest;
   friend class DirectPrecedenceGroupLookupRequest;
 
+  /// The ABI name of the module, if it differs from the module name.
+  mutable Identifier ModuleABIName;
+
 public:
   /// Produces the components of a given module's full name in reverse order.
   ///
@@ -249,6 +254,8 @@ private:
   /// \see EntryPointInfoTy
   EntryPointInfoTy EntryPointInfo;
 
+  AccessNotesFile accessNotes;
+
   ModuleDecl(Identifier name, ASTContext &ctx, ImplicitImportInfo importInfo);
 
 public:
@@ -278,6 +285,9 @@ public:
   /// Retrieve a list of modules that each file of this module implicitly
   /// imports.
   ImplicitImportList getImplicitImports() const;
+
+  AccessNotesFile &getAccessNotes() { return accessNotes; }
+  const AccessNotesFile &getAccessNotes() const { return accessNotes; }
 
   ArrayRef<FileUnit *> getFiles() {
     assert(!Files.empty() || failedToLoad());
@@ -336,6 +346,15 @@ public:
   /// Get the list of all modules this module declares a cross-import with.
   void getDeclaredCrossImportBystanders(
       SmallVectorImpl<Identifier> &bystanderNames);
+
+  /// Retrieve the ABI name of the module, which is used for metadata and
+  /// mangling.
+  Identifier getABIName() const;
+
+  /// Set the ABI name of the module;
+  void setABIName(Identifier name) {
+    ModuleABIName = name;
+  }
 
 private:
   /// A cache of this module's underlying module and required bystander if it's
@@ -443,6 +462,9 @@ public:
   void setResilienceStrategy(ResilienceStrategy strategy) {
     Bits.ModuleDecl.RawResilienceStrategy = unsigned(strategy);
   }
+
+  /// Distribution level of the module.
+  LibraryLevel getLibraryLevel() const;
 
   /// Returns true if this module was or is being compiled for testing.
   bool hasIncrementalInfo() const { return Bits.ModuleDecl.HasIncrementalInfo; }
@@ -734,7 +756,20 @@ public:
 
   /// Calls \p callback for each source file of the module.
   void collectBasicSourceFileInfo(
-      llvm::function_ref<void(const BasicSourceFileInfo &)> callback);
+      llvm::function_ref<void(const BasicSourceFileInfo &)> callback) const;
+
+public:
+  /// Retrieve a fingerprint value that summarizes the contents of this module.
+  ///
+  /// This interface hash a of a module is guaranteed to change if the interface
+  /// hash of any of its (primary) source files changes. For example, when
+  /// building incrementally, the interface hash of this module will change when
+  /// the primaries contributing to its content changes. In contrast, when
+  /// a module is deserialized, the hash of every source file contributes to
+  /// the module's interface hash. It therefore serves as an effective, if
+  /// coarse-grained, way of determining when top-level changes to a module's
+  /// contents have been made.
+  Fingerprint getFingerprint() const;
 
   SourceRange getSourceRange() const { return SourceRange(); }
 

@@ -359,10 +359,6 @@ private:
     case Node::Kind::DependentPseudogenericSignature:
     case Node::Kind::Destructor:
     case Node::Kind::DidSet:
-    case Node::Kind::DifferentiableFunctionType:
-    case Node::Kind::EscapingDifferentiableFunctionType:
-    case Node::Kind::LinearFunctionType:
-    case Node::Kind::EscapingLinearFunctionType:
     case Node::Kind::DirectMethodReferenceAttribute:
     case Node::Kind::Directness:
     case Node::Kind::DynamicAttribute:
@@ -400,11 +396,10 @@ private:
     case Node::Kind::Index:
     case Node::Kind::IVarInitializer:
     case Node::Kind::IVarDestroyer:
-    case Node::Kind::ImplDifferentiable:
-    case Node::Kind::ImplLinear:
+    case Node::Kind::ImplDifferentiabilityKind:
     case Node::Kind::ImplEscaping:
     case Node::Kind::ImplConvention:
-    case Node::Kind::ImplDifferentiability:
+    case Node::Kind::ImplParameterResultDifferentiability:
     case Node::Kind::ImplFunctionAttribute:
     case Node::Kind::ImplFunctionConvention:
     case Node::Kind::ImplFunctionConventionName:
@@ -420,6 +415,7 @@ private:
     case Node::Kind::InfixOperator:
     case Node::Kind::Initializer:
     case Node::Kind::PropertyWrapperBackingInitializer:
+    case Node::Kind::PropertyWrapperInitFromProjectedValue:
     case Node::Kind::KeyPathGetterThunkHelper:
     case Node::Kind::KeyPathSetterThunkHelper:
     case Node::Kind::KeyPathEqualsThunkHelper:
@@ -518,6 +514,8 @@ private:
     case Node::Kind::ReflectionMetadataSuperclassDescriptor:
     case Node::Kind::ResilientProtocolWitnessTable:
     case Node::Kind::GenericTypeParamDecl:
+    case Node::Kind::ConcurrentFunctionType:
+    case Node::Kind::DifferentiableFunctionType:
     case Node::Kind::AsyncAnnotation:
     case Node::Kind::ThrowsAnnotation:
     case Node::Kind::EmptyList:
@@ -566,8 +564,15 @@ private:
     case Node::Kind::CanonicalPrespecializedGenericTypeCachingOnceToken:
     case Node::Kind::AsyncFunctionPointer:
     case Node::Kind::AutoDiffFunction:
+    case Node::Kind::AutoDiffDerivativeVTableThunk:
+    case Node::Kind::AutoDiffSelfReorderingReabstractionThunk:
+    case Node::Kind::AutoDiffSubsetParametersThunk:
     case Node::Kind::AutoDiffFunctionKind:
+    case Node::Kind::DifferentiabilityWitness:
+    case Node::Kind::NoDerivative:
     case Node::Kind::IndexSubset:
+    case Node::Kind::AsyncAwaitResumePartialFunction:
+    case Node::Kind::AsyncSuspendResumePartialFunction:
       return false;
     }
     printer_unreachable("bad node kind");
@@ -762,7 +767,7 @@ private:
   }
 
   void printFunctionType(NodePointer LabelList, NodePointer node) {
-    if (node->getNumChildren() < 2 || node->getNumChildren() > 5) {
+    if (node->getNumChildren() < 2 || node->getNumChildren() > 6) {
       setInvalid();
       return;
     }
@@ -797,20 +802,19 @@ private:
     case Node::Kind::ObjCBlock:
       printConventionWithMangledCType("block");
       break;
-    case Node::Kind::DifferentiableFunctionType:
-      Printer << "@differentiable "; break;
-    case Node::Kind::EscapingDifferentiableFunctionType:
-      Printer << "@escaping @differentiable "; break;
-    case Node::Kind::LinearFunctionType:
-      Printer << "@differentiable(linear) "; break;
-    case Node::Kind::EscapingLinearFunctionType:
-      Printer << "@escaping @differentiable(linear) "; break;
     default:
       assert(false && "Unhandled function type in printFunctionType!");
     }
 
     unsigned startIndex = 0;
-    bool isAsync = false, isThrows = false;
+    bool isSendable = false, isAsync = false, isThrows = false;
+    auto diffKind = MangledDifferentiabilityKind::NonDifferentiable;
+    if (node->getChild(startIndex)->getKind() ==
+        Node::Kind::DifferentiableFunctionType) {
+      diffKind =
+          (MangledDifferentiabilityKind)node->getChild(startIndex)->getIndex();
+      ++startIndex;
+    }
     if (node->getChild(startIndex)->getKind() == Node::Kind::ClangType) {
       // handled earlier
       ++startIndex;
@@ -819,10 +823,35 @@ private:
       ++startIndex;
       isThrows = true;
     }
+    if (node->getChild(startIndex)->getKind()
+            == Node::Kind::ConcurrentFunctionType) {
+      ++startIndex;
+      isSendable = true;
+    }
     if (node->getChild(startIndex)->getKind() == Node::Kind::AsyncAnnotation) {
       ++startIndex;
       isAsync = true;
     }
+
+    switch (diffKind) {
+    case MangledDifferentiabilityKind::Forward:
+      Printer << "@differentiable(_forward) ";
+      break;
+    case MangledDifferentiabilityKind::Reverse:
+      Printer << "@differentiable(reverse) ";
+      break;
+    case MangledDifferentiabilityKind::Linear:
+      Printer << "@differentiable(_linear) ";
+      break;
+    case MangledDifferentiabilityKind::Normal:
+      Printer << "@differentiable ";
+      break;
+    case MangledDifferentiabilityKind::NonDifferentiable:
+      break;
+    }
+
+    if (isSendable)
+      Printer << "@Sendable ";
 
     printFunctionParameters(LabelList, node->getChild(startIndex),
                             Options.ShowFunctionArgumentTypes);
@@ -1254,6 +1283,10 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
     return printEntity(
          Node, asPrefixContext, TypePrinting::NoType,
          /*hasName*/false, "property wrapper backing initializer");
+  case Node::Kind::PropertyWrapperInitFromProjectedValue:
+    return printEntity(
+         Node, asPrefixContext, TypePrinting::NoType,
+         /*hasName*/false, "property wrapper init from projected value");
   case Node::Kind::DefaultArgumentInitializer:
     return printEntity(Node, asPrefixContext, TypePrinting::NoType,
                        /*hasName*/false, "default argument ",
@@ -1325,10 +1358,6 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
   case Node::Kind::CFunctionPointer:
   case Node::Kind::ObjCBlock:
   case Node::Kind::EscapingObjCBlock:
-  case Node::Kind::DifferentiableFunctionType:
-  case Node::Kind::EscapingDifferentiableFunctionType:
-  case Node::Kind::LinearFunctionType:
-  case Node::Kind::EscapingLinearFunctionType:
     printFunctionType(nullptr, Node);
     return nullptr;
   case Node::Kind::ClangType:
@@ -1391,6 +1420,10 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
     return nullptr;
   case Node::Kind::Owned:
     Printer << "__owned ";
+    print(Node->getChild(0));
+    return nullptr;
+  case Node::Kind::NoDerivative:
+    Printer << "@noDerivative ";
     print(Node->getChild(0));
     return nullptr;
   case Node::Kind::NonObjCAttribute:
@@ -1729,18 +1762,33 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
     print(Node->getChild(idx));
     return nullptr;
   }
-  case Node::Kind::AutoDiffFunction: {
-    auto childIt = Node->begin();
-    auto original = *childIt++;
-    NodePointer optionalGenSig =
-        (*childIt)->getKind() == Node::Kind::DependentGenericSignature
-            ? *childIt++ : nullptr;
-    auto kind = *childIt++;
-    auto paramIndices = *childIt++;
-    auto resultIndices = *childIt++;
-    print(kind);
+  case Node::Kind::AutoDiffFunction:
+  case Node::Kind::AutoDiffDerivativeVTableThunk: {
+    unsigned prefixEndIndex = 0;
+    while (prefixEndIndex != Node->getNumChildren() &&
+           Node->getChild(prefixEndIndex)->getKind()
+              != Node::Kind::AutoDiffFunctionKind)
+      ++prefixEndIndex;
+    auto funcKind = Node->getChild(prefixEndIndex);
+    auto paramIndices = Node->getChild(prefixEndIndex + 1);
+    auto resultIndices = Node->getChild(prefixEndIndex + 2);
+    if (kind == Node::Kind::AutoDiffDerivativeVTableThunk)
+      Printer << "vtable thunk for ";
+    print(funcKind);
     Printer << " of ";
-    print(original);
+    NodePointer optionalGenSig = nullptr;
+    for (unsigned i = 0; i < prefixEndIndex; ++i) {
+      // The last node may be a generic signature. If so, print it later.
+      if (i == prefixEndIndex - 1 &&
+          Node->getChild(i)->getKind()
+              == Node::Kind::DependentGenericSignature) {
+        optionalGenSig = Node->getChild(i);
+        break;
+      }
+      print(Node->getChild(i));
+    }
+    if (Options.ShortenThunk)
+      return nullptr;
     Printer << " with respect to parameters ";
     print(paramIndices);
     Printer << " and results ";
@@ -1748,6 +1796,61 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
     if (optionalGenSig && Options.DisplayWhereClauses) {
       Printer << " with ";
       print(optionalGenSig);
+    }
+    return nullptr;
+  }
+  case Node::Kind::AutoDiffSelfReorderingReabstractionThunk: {
+    Printer << "autodiff self-reordering reabstraction thunk ";
+    auto childIt = Node->begin();
+    auto fromType = *childIt++;
+    auto toType = *childIt++;
+    if (Options.ShortenThunk) {
+      Printer << "for ";
+      print(fromType);
+      return nullptr;
+    }
+    NodePointer optionalGenSig =
+        (*childIt)->getKind() == Node::Kind::DependentGenericSignature
+            ? *childIt++ : nullptr;
+    Printer << "for ";
+    print(*childIt++); // kind
+    if (optionalGenSig) {
+      print(optionalGenSig);
+      Printer << ' ';
+    }
+    Printer << " from ";
+    print(fromType);
+    Printer << " to ";
+    print(toType);
+    return nullptr;
+  }
+  case Node::Kind::AutoDiffSubsetParametersThunk: {
+    Printer << "autodiff subset parameters thunk for ";
+    auto currentIndex = Node->getNumChildren() - 1;
+    auto toParamIndices = Node->getChild(currentIndex--);
+    auto resultIndices = Node->getChild(currentIndex--);
+    auto paramIndices = Node->getChild(currentIndex--);
+    auto kind = Node->getChild(currentIndex--);
+    print(kind);
+    Printer << " from ";
+    // Print the "from" thing.
+    if (currentIndex == 0) {
+      print(Node->getFirstChild()); // the "from" type
+    } else {
+      for (unsigned i = 0; i < currentIndex; ++i) // the "from" global
+        print(Node->getChild(i));
+    }
+    if (Options.ShortenThunk)
+      return nullptr;
+    Printer << " with respect to parameters ";
+    print(paramIndices);
+    Printer << " and results ";
+    print(resultIndices);
+    Printer << " to parameters ";
+    print(toParamIndices);
+    if (currentIndex > 0) {
+      Printer << " of type ";
+      print(Node->getChild(currentIndex)); // "to" type
     }
     return nullptr;
   }
@@ -1766,6 +1869,47 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
     case AutoDiffFunctionKind::Pullback:
       Printer << "pullback";
       break;
+    }
+    return nullptr;
+  }
+  case Node::Kind::DifferentiabilityWitness: {
+    auto kindNodeIndex = Node->getNumChildren() - (
+        Node->getLastChild()->getKind() == Node::Kind::DependentGenericSignature
+            ? 4 : 3);
+    auto kind =
+        (MangledDifferentiabilityKind)Node->getChild(kindNodeIndex)->getIndex();
+    switch (kind) {
+    case MangledDifferentiabilityKind::Forward:
+      Printer << "forward-mode";
+      break;
+    case MangledDifferentiabilityKind::Reverse:
+      Printer << "reverse-mode";
+      break;
+    case MangledDifferentiabilityKind::Normal:
+      Printer << "normal";
+      break;
+    case MangledDifferentiabilityKind::Linear:
+      Printer << "linear";
+      break;
+    case MangledDifferentiabilityKind::NonDifferentiable:
+      assert(false && "Impossible case");
+    }
+    Printer << " differentiability witness for ";
+    unsigned idx = 0;
+    for (auto numChildren = Node->getNumChildren();
+         idx < numChildren &&
+             Node->getChild(idx)->getKind() != Node::Kind::Index; ++idx)
+      print(Node->getChild(idx));
+    ++idx; // kind (handled earlier)
+    Printer << " with respect to parameters ";
+    print(Node->getChild(idx++)); // parameter indices
+    Printer << " and results ";
+    print(Node->getChild(idx++));
+    if (idx < Node->getNumChildren()) {
+      auto *genSig = Node->getChild(idx);
+      assert(genSig->getKind() == Node::Kind::DependentGenericSignature);
+      Printer << " with ";
+      print(genSig);
     }
     return nullptr;
   }
@@ -2168,11 +2312,23 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
     return nullptr;
   case Node::Kind::LabelList:
     return nullptr;
-  case Node::Kind::ImplDifferentiable:
+  case Node::Kind::ImplDifferentiabilityKind:
     Printer << "@differentiable";
-    return nullptr;
-  case Node::Kind::ImplLinear:
-    Printer << "@differentiable(linear)";
+    switch ((MangledDifferentiabilityKind)Node->getIndex()) {
+    case MangledDifferentiabilityKind::Normal:
+      break;
+    case MangledDifferentiabilityKind::Linear:
+      Printer << "(_linear)";
+      break;
+    case MangledDifferentiabilityKind::Forward:
+      Printer << "(_forward)";
+      break;
+    case MangledDifferentiabilityKind::Reverse:
+      Printer << "(reverse)";
+      break;
+    case MangledDifferentiabilityKind::NonDifferentiable:
+      assert(false && "Impossible case 'NonDifferentiable'");
+    }
     return nullptr;
   case Node::Kind::ImplEscaping:
     Printer << "@escaping";
@@ -2180,7 +2336,7 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
   case Node::Kind::ImplConvention:
     Printer << Node->getText();
     return nullptr;
-  case Node::Kind::ImplDifferentiability:
+  case Node::Kind::ImplParameterResultDifferentiability:
     // Skip if text is empty.
     if (Node->getText().empty())
       return nullptr;
@@ -2398,11 +2554,35 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
     print(Node->getChild(0));
     return nullptr;
 
+  case Node::Kind::ConcurrentFunctionType:
+    Printer << "@Sendable ";
+    return nullptr;
+  case Node::Kind::DifferentiableFunctionType: {
+    Printer << "@differentiable";
+    auto kind = (MangledDifferentiabilityKind)Node->getIndex();
+    switch (kind) {
+    case MangledDifferentiabilityKind::Forward:
+      Printer << "(_forward)";
+      break;
+    case MangledDifferentiabilityKind::Reverse:
+      Printer << "(reverse)";
+      break;
+    case MangledDifferentiabilityKind::Linear:
+      Printer << "(_linear)";
+      break;
+    case MangledDifferentiabilityKind::Normal:
+      break;
+    case MangledDifferentiabilityKind::NonDifferentiable:
+      assert(false && "Unexpected case NonDifferentiable");
+    }
+    Printer << ' ';
+    return nullptr;
+  }
   case Node::Kind::AsyncAnnotation:
-    Printer<< " async ";
+    Printer << " async ";
     return nullptr;
   case Node::Kind::ThrowsAnnotation:
-    Printer<< " throws ";
+    Printer << " throws ";
     return nullptr;
   case Node::Kind::EmptyList:
     Printer << " empty-list ";
@@ -2604,9 +2784,24 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
     LLVM_FALLTHROUGH;
   case Node::Kind::ObjCAsyncCompletionHandlerImpl:
     Printer << "@objc completion handler block implementation for ";
+    if (Node->getNumChildren() >= 4)
+      print(Node->getChild(3));
     print(Node->getChild(0));
     Printer << " with result type ";
     print(Node->getChild(1));
+    switch (Node->getChild(2)->getIndex()) {
+    case 0:
+      break;
+    case 1:
+      Printer << " nonzero on error";
+      break;
+    case 2:
+      Printer << " zero on error";
+      break;
+    default:
+      Printer << " <invalid error flag>";
+      break;
+    }
     return nullptr;
   case Node::Kind::CanonicalPrespecializedGenericTypeCachingOnceToken:
     Printer << "flag for loading of canonical specialized generic type "
@@ -2616,7 +2811,20 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
   case Node::Kind::AsyncFunctionPointer:
     Printer << "async function pointer to ";
     return nullptr;
+  case Node::Kind::AsyncAwaitResumePartialFunction:
+    Printer << "(";
+    print(Node->getChild(0));
+    Printer << ")";
+    Printer << " await resume partial function for ";
+    return nullptr;
+  case Node::Kind::AsyncSuspendResumePartialFunction:
+    Printer << "(";
+    print(Node->getChild(0));
+    Printer << ")";
+    Printer << " suspend resume partial function for ";
+    return nullptr;
   }
+
   printer_unreachable("bad node kind!");
 }
 
@@ -2744,7 +2952,8 @@ printEntity(NodePointer Entity, bool asPrefixContext, TypePrinting TypePr,
     // Print any left over context which couldn't be printed in prefix form.
     if (Entity->getKind() == Node::Kind::DefaultArgumentInitializer ||
         Entity->getKind() == Node::Kind::Initializer ||
-        Entity->getKind() == Node::Kind::PropertyWrapperBackingInitializer) {
+        Entity->getKind() == Node::Kind::PropertyWrapperBackingInitializer ||
+        Entity->getKind() == Node::Kind::PropertyWrapperInitFromProjectedValue) {
       Printer << " of ";
     } else {
       Printer << " in ";

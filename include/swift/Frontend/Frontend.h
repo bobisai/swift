@@ -204,6 +204,12 @@ public:
 
   void setRuntimeResourcePath(StringRef Path);
 
+  /// Compute the default prebuilt module cache path for a given resource path
+  /// and SDK version. This function is also used by LLDB.
+  static std::string
+  computePrebuiltCachePath(StringRef RuntimeResourcePath, llvm::Triple target,
+                           Optional<llvm::VersionTuple> sdkVer);
+
   /// If we haven't explicitly passed -prebuilt-module-cache-path, set it to
   /// the default value of <resource-dir>/<platform>/prebuilt-modules.
   /// @note This should be called once, after search path options and frontend
@@ -467,7 +473,9 @@ public:
   DiagnosticEngine &getDiags() { return Diagnostics; }
   const DiagnosticEngine &getDiags() const { return Diagnostics; }
 
-  llvm::vfs::FileSystem &getFileSystem() { return *SourceMgr.getFileSystem(); }
+  llvm::vfs::FileSystem &getFileSystem() const {
+    return *SourceMgr.getFileSystem();
+  }
 
   ASTContext &getASTContext() { return *Context; }
   const ASTContext &getASTContext() const { return *Context; }
@@ -558,8 +566,11 @@ private:
   bool setUpInputs();
   bool setUpASTContextIfNeeded();
   void setupStatsReporter();
-  void setupDiagnosticVerifierIfNeeded();
   void setupDependencyTrackerIfNeeded();
+
+  /// \return false if successsful, true on error.
+  bool setupDiagnosticVerifierIfNeeded();
+
   Optional<unsigned> setUpCodeCompletionBuffer();
 
   /// Find a buffer for a given input file and ensure it is recorded in

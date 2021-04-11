@@ -109,7 +109,8 @@ public:
   }
 
   hash_code visitValueToBridgeObjectInst(ValueToBridgeObjectInst *X) {
-    return llvm::hash_combine(X->getKind(), X->getOperand());
+    return llvm::hash_combine(X->getKind(),
+                              lookThroughOwnershipInsts(X->getOperand()));
   }
 
   hash_code visitRefToBridgeObjectInst(RefToBridgeObjectInst *X) {
@@ -138,12 +139,12 @@ public:
   }
 
   hash_code visitUncheckedAddrCastInst(UncheckedAddrCastInst *X) {
-    return llvm::hash_combine(X->getKind(), X->getType(), X->getOperand());
+    return llvm::hash_combine(X->getKind(), X->getType(),
+                              lookThroughOwnershipInsts(X->getOperand()));
   }
 
   hash_code visitFunctionRefInst(FunctionRefInst *X) {
-    return llvm::hash_combine(X->getKind(),
-                              X->getInitiallyReferencedFunction());
+    return llvm::hash_combine(X->getKind(), X->getReferencedFunction());
   }
 
   hash_code visitGlobalAddrInst(GlobalAddrInst *X) {
@@ -159,11 +160,14 @@ public:
   }
 
   hash_code visitRefElementAddrInst(RefElementAddrInst *X) {
-    return llvm::hash_combine(X->getKind(), X->getOperand(), X->getField());
+    return llvm::hash_combine(X->getKind(),
+                              lookThroughOwnershipInsts(X->getOperand()),
+                              X->getField());
   }
 
   hash_code visitRefTailAddrInst(RefTailAddrInst *X) {
-    return llvm::hash_combine(X->getKind(), X->getOperand());
+    return llvm::hash_combine(X->getKind(),
+                              lookThroughOwnershipInsts(X->getOperand()));
   }
 
   hash_code visitProjectBoxInst(ProjectBoxInst *X) {
@@ -177,7 +181,8 @@ public:
   }
 
   hash_code visitRawPointerToRefInst(RawPointerToRefInst *X) {
-    return llvm::hash_combine(X->getKind(), X->getOperand());
+    return llvm::hash_combine(X->getKind(),
+                              lookThroughOwnershipInsts(X->getOperand()));
   }
 
 #define LOADABLE_REF_STORAGE(Name, ...) \
@@ -280,7 +285,8 @@ public:
   }
 
   hash_code visitValueMetatypeInst(ValueMetatypeInst *X) {
-    return llvm::hash_combine(X->getKind(), X->getType(), X->getOperand());
+    return llvm::hash_combine(X->getKind(), X->getType(),
+                              lookThroughOwnershipInsts(X->getOperand()));
   }
 
   hash_code visitExistentialMetatypeInst(ExistentialMetatypeInst *X) {
@@ -348,12 +354,14 @@ public:
     // We hash the enum by hashing its kind, element, and operand if it has one.
     if (!X->hasOperand())
       return llvm::hash_combine(X->getKind(), X->getElement());
-    return llvm::hash_combine(X->getKind(), X->getElement(), X->getOperand());
+    return llvm::hash_combine(X->getKind(), X->getElement(),
+                              lookThroughOwnershipInsts(X->getOperand()));
   }
 
   hash_code visitUncheckedEnumDataInst(UncheckedEnumDataInst *X) {
     // We hash the enum by hashing its kind, element, and operand.
-    return llvm::hash_combine(X->getKind(), X->getElement(), X->getOperand());
+    return llvm::hash_combine(X->getKind(), X->getElement(),
+                              lookThroughOwnershipInsts(X->getOperand()));
   }
 
   hash_code visitIndexAddrInst(IndexAddrInst *X) {
@@ -384,11 +392,10 @@ public:
   }
 
   hash_code visitSelectEnumInstBase(SelectEnumInstBase *X) {
-    auto hash = llvm::hash_combine(X->getKind(),
-                                   X->getEnumOperand(),
-                                   X->getType(),
-                                   X->hasDefault());
-    
+    auto hash = llvm::hash_combine(
+        X->getKind(), lookThroughOwnershipInsts(X->getEnumOperand()),
+        X->getType(), X->hasDefault());
+
     for (unsigned i = 0, e = X->getNumCases(); i < e; ++i) {
       hash = llvm::hash_combine(hash, X->getCase(i).first,
                                 X->getCase(i).second);
@@ -410,9 +417,8 @@ public:
 
   hash_code visitSelectValueInst(SelectValueInst *X) {
     auto hash = llvm::hash_combine(X->getKind(),
-                                   X->getOperand(),
-                                   X->getType(),
-                                   X->hasDefault());
+                                   lookThroughOwnershipInsts(X->getOperand()),
+                                   X->getType(), X->hasDefault());
 
     for (unsigned i = 0, e = X->getNumCases(); i < e; ++i) {
       hash = llvm::hash_combine(hash, X->getCase(i).first,
@@ -447,6 +453,14 @@ public:
   }
 
   hash_code visitMarkDependenceInst(MarkDependenceInst *X) {
+    if (X->getFunction()->hasOwnership()) {
+      auto TransformedOpValues =
+          X->getOperandValues(lookThroughOwnershipInsts, false);
+      return llvm::hash_combine(
+          X->getKind(), X->getType(),
+          llvm::hash_combine_range(TransformedOpValues.begin(),
+                                   TransformedOpValues.end()));
+    }
     OperandValueArrayRef Operands(X->getAllOperands());
     return llvm::hash_combine(
         X->getKind(), X->getType(),
@@ -629,20 +643,20 @@ private:
   class StackNode {
    public:
     StackNode(ScopedHTType *availableValues, DominanceInfoNode *n,
-              DominanceInfoNode::iterator child,
-              DominanceInfoNode::iterator end)
+              DominanceInfoNode::const_iterator child,
+              DominanceInfoNode::const_iterator end)
         : Node(n), ChildIter(child), EndIter(end), Scopes(availableValues),
       Processed(false) {}
 
     // Accessors.
     DominanceInfoNode *node() { return Node; }
-    DominanceInfoNode::iterator childIter() { return ChildIter; }
+    DominanceInfoNode::const_iterator childIter() { return ChildIter; }
     DominanceInfoNode *nextChild() {
       DominanceInfoNode *child = *ChildIter;
       ++ChildIter;
       return child;
     }
-    DominanceInfoNode::iterator end() { return EndIter; }
+    DominanceInfoNode::const_iterator end() { return EndIter; }
     bool isProcessed() { return Processed; }
     void process() { Processed = true; }
 
@@ -652,8 +666,8 @@ private:
 
     // Members.
     DominanceInfoNode *Node;
-    DominanceInfoNode::iterator ChildIter;
-    DominanceInfoNode::iterator EndIter;
+    DominanceInfoNode::const_iterator ChildIter;
+    DominanceInfoNode::const_iterator EndIter;
     NodeScope Scopes;
     bool Processed;
   };
@@ -1271,7 +1285,7 @@ static bool tryToCSEOpenExtCall(OpenExistentialAddrInst *From,
 
   ApplyInst *NAI = Builder.createApply(ToAI->getLoc(), ToWMI,
                                        ToAI->getSubstitutionMap(), Args,
-                                       ToAI->isNonThrowing());
+                                       ToAI->getApplyOptions());
   FromAI->replaceAllUsesWith(NAI);
   FromAI->eraseFromParent();
   ++NumOpenExtRemoved;
@@ -1397,9 +1411,8 @@ class SILCSE : public SILFunctionTransform {
 
     auto *Fn = getFunction();
     DeadEndBlocks DeadEndBBs(Fn);
-    JointPostDominanceSetComputer Computer(DeadEndBBs);
     InstModCallbacks callbacks;
-    OwnershipFixupContext FixupCtx{callbacks, DeadEndBBs, Computer};
+    OwnershipFixupContext FixupCtx{callbacks, DeadEndBBs};
     CSE C(RunsOnHighLevelSil, SEA, FuncBuilder, DeadEndBBs, FixupCtx);
     bool Changed = false;
 

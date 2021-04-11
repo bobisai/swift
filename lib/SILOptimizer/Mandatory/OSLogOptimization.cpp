@@ -91,6 +91,7 @@
 #include "swift/SIL/SILLocation.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/TypeLowering.h"
+#include "swift/SIL/BasicBlockBits.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/CFGOptUtils.h"
@@ -322,8 +323,9 @@ static bool isFoldableArray(SILValue value, ASTContext &astContext) {
     return true;
   SILFunction *callee = cast<ApplyInst>(constructorInst)->getCalleeFunction();
   return !callee ||
-         (!callee->hasSemanticsAttr("array.init.empty") &&
-          !callee->hasSemanticsAttr("array.uninitialized_intrinsic"));
+         (!callee->hasSemanticsAttr(semantics::ARRAY_INIT_EMPTY) &&
+          !callee->hasSemanticsAttr(semantics::ARRAY_UNINITIALIZED_INTRINSIC) &&
+          !callee->hasSemanticsAttr(semantics::ARRAY_FINALIZE_INTRINSIC));
 }
 
 /// Return true iff the given value is a closure but is not a creation of a
@@ -560,7 +562,7 @@ static SILValue emitCodeForConstantArray(ArrayRef<SILValue> elements,
   FunctionRefInst *arrayAllocateRef =
       builder.createFunctionRef(loc, arrayAllocateFun);
   ApplyInst *applyInst = builder.createApply(
-      loc, arrayAllocateRef, subMap, ArrayRef<SILValue>(numElementsSIL), false);
+      loc, arrayAllocateRef, subMap, ArrayRef<SILValue>(numElementsSIL));
 
   // Extract the elements of the tuple returned by the call to the allocator.
   DestructureTupleInst *destructureInst =
@@ -696,7 +698,7 @@ static SILValue emitCodeForSymbolicValue(SymbolicValue symVal,
     FunctionRefInst *stringInitRef =
         builder.createFunctionRef(loc, stringInfo.getStringInitIntrinsic());
     ApplyInst *applyInst = builder.createApply(
-        loc, stringInitRef, SubstitutionMap(), ArrayRef<SILValue>(args), false);
+        loc, stringInitRef, SubstitutionMap(), ArrayRef<SILValue>(args));
     return applyInst;
   }
   case SymbolicValue::Integer: { // Builtin integer types.
@@ -996,6 +998,14 @@ static void substituteConstants(FoldState &foldState) {
   for (SILValue constantSILValue : foldState.getConstantSILValues()) {
     SymbolicValue constantSymbolicVal =
         evaluator.lookupConstValue(constantSILValue).getValue();
+    // Make sure that the symbolic value tracked in the foldState is a constant.
+    // In the case of ArraySymbolicValue, the array storage could be a non-constant
+    // if some instruction in the array initialization sequence was not evaluated
+    // and skipped.
+    if (!constantSymbolicVal.containsOnlyConstants()) {
+      assert(constantSymbolicVal.getKind() != SymbolicValue::String && "encountered non-constant string symbolic value");
+      continue;
+    }
 
     SILInstruction *definingInst = constantSILValue->getDefiningInstruction();
     assert(definingInst);
@@ -1402,19 +1412,23 @@ static SILInstruction *beginOfInterpolation(ApplyInst *oslogInit) {
   // formatting and privacy options are literals, all candidate instructions
   // must be in the same basic block. But, this code doesn't rely on that
   // assumption.
-  SmallPtrSet<SILBasicBlock *, 4> candidateBBs;
+  BasicBlockSet candidateBBs(oslogInit->getFunction());
+  SILBasicBlock *candidateBB = nullptr;
+  unsigned numCandidateBBsFound = 0;
   for (auto *candidate: candidateStartInstructions) {
-    SILBasicBlock *candidateBB = candidate->getParent();
-    candidateBBs.insert(candidateBB);
+    candidateBB = candidate->getParent();
+    if (candidateBBs.insert(candidateBB))
+      ++numCandidateBBsFound;
   }
 
   SILBasicBlock *firstBB = nullptr;
-  if (candidateBBs.size() == 1) {
-    firstBB = *candidateBBs.begin();
+  if (numCandidateBBsFound == 1) {
+    assert(candidateBB);
+    firstBB = candidateBB;
   } else {
     SILBasicBlock *entryBB = oslogInit->getFunction()->getEntryBlock();
     for (SILBasicBlock *bb : llvm::breadth_first<SILBasicBlock *>(entryBB)) {
-      if (candidateBBs.count(bb)) {
+      if (candidateBBs.contains(bb)) {
         firstBB = bb;
         break;
       }
