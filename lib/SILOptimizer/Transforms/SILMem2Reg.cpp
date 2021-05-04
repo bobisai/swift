@@ -21,6 +21,7 @@
 #define DEBUG_TYPE "sil-mem2reg"
 
 #include "swift/AST/DiagnosticsSIL.h"
+#include "swift/SIL/BasicBlockDatastructures.h"
 #include "swift/SIL/Dominance.h"
 #include "swift/SIL/Projection.h"
 #include "swift/SIL/SILBuilder.h"
@@ -28,12 +29,13 @@
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/TypeLowering.h"
-#include "swift/SIL/BasicBlockBits.h"
 #include "swift/SILOptimizer/Analysis/DominanceAnalysis.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/CFGOptUtils.h"
 #include "swift/SILOptimizer/Utils/InstOptUtils.h"
+#include "swift/SILOptimizer/Utils/OwnershipOptUtils.h"
+#include "swift/SILOptimizer/Utils/ScopeOptUtils.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -41,12 +43,13 @@
 #include "llvm/Support/Debug.h"
 #include <algorithm>
 #include <queue>
+
 using namespace swift;
+using namespace swift::siloptimizer;
 
 STATISTIC(NumAllocStackFound,    "Number of AllocStack found");
 STATISTIC(NumAllocStackCaptured, "Number of AllocStack captured");
 STATISTIC(NumInstRemoved,        "Number of Instructions removed");
-STATISTIC(NumPhiPlaced,          "Number of Phi blocks placed");
 
 namespace {
 
@@ -59,7 +62,8 @@ using DomTreeLevelMap = llvm::DenseMap<DomTreeNode *, unsigned>;
 //                                 Utilities
 //===----------------------------------------------------------------------===//
 
-static void replaceDestroy(DestroyAddrInst *dai, SILValue newValue) {
+static void replaceDestroy(DestroyAddrInst *dai, SILValue newValue,
+                           SILBuilderContext &ctx) {
   SILFunction *f = dai->getFunction();
   auto ty = dai->getOperand()->getType();
 
@@ -68,7 +72,7 @@ static void replaceDestroy(DestroyAddrInst *dai, SILValue newValue) {
   assert(newValue ||
          (ty.is<TupleType>() && ty.getAs<TupleType>()->getNumElements() == 0));
 
-  SILBuilderWithScope builder(dai);
+  SILBuilderWithScope builder(dai, ctx);
 
   auto &typeLowering = f->getTypeLowering(ty);
 
@@ -84,21 +88,22 @@ static void replaceDestroy(DestroyAddrInst *dai, SILValue newValue) {
 
 /// Promote a DebugValueAddr to a DebugValue of the given value.
 static void promoteDebugValueAddr(DebugValueAddrInst *dvai, SILValue value,
-                                  SILBuilder &b) {
+                                  SILBuilderContext &ctx) {
   assert(dvai->getOperand()->getType().isLoadable(*dvai->getFunction()) &&
          "Unexpected promotion of address-only type!");
   assert(value && "Expected valid value");
   // Avoid inserting the same debug_value twice.
-  for (auto *use : value->getUses())
-    if (auto *dvi = dyn_cast<DebugValueInst>(use->getUser()))
+  for (auto *use : value->getUses()) {
+    if (auto *dvi = dyn_cast<DebugValueInst>(use->getUser())) {
       if (*dvi->getVarInfo() == *dvai->getVarInfo()) {
         dvai->eraseFromParent();
         return;
       }
-  b.setInsertionPoint(dvai);
-  b.setCurrentDebugScope(dvai->getDebugScope());
-  b.createDebugValue(dvai->getLoc(), value, *dvai->getVarInfo());
+    }
+  }
 
+  SILBuilderWithScope b(dvai, ctx);
+  b.createDebugValue(dvai->getLoc(), value, *dvai->getVarInfo());
   dvai->eraseFromParent();
 }
 
@@ -135,10 +140,12 @@ static void collectLoads(SILInstruction *i,
   }
 }
 
-static void replaceLoad(LoadInst *li, SILValue newValue, AllocStackInst *asi) {
+static void replaceLoad(LoadInst *li, SILValue newValue, AllocStackInst *asi,
+                        SILBuilderContext &ctx) {
   ProjectionPath projections(newValue->getType());
   SILValue op = li->getOperand();
-  SILBuilderWithScope builder(li);
+  SILBuilderWithScope builder(li, ctx);
+  SILOptScope scope;
 
   while (op != asi) {
     assert(isa<UncheckedAddrCastInst>(op) || isa<StructElementAddrInst>(op) ||
@@ -148,29 +155,28 @@ static void replaceLoad(LoadInst *li, SILValue newValue, AllocStackInst *asi) {
     op = inst->getOperand(0);
   }
 
-  SmallVector<SILValue, 4> borrowedVals;
-  for (auto iter = projections.rbegin(); iter != projections.rend(); ++iter) {
-    const Projection &projection = *iter;
-    assert(projection.getKind() == ProjectionKind::BitwiseCast ||
-           projection.getKind() == ProjectionKind::Struct ||
-           projection.getKind() == ProjectionKind::Tuple);
+  for (const auto &proj : llvm::reverse(projections)) {
+    assert(proj.getKind() == ProjectionKind::BitwiseCast ||
+           proj.getKind() == ProjectionKind::Struct ||
+           proj.getKind() == ProjectionKind::Tuple);
 
     // struct_extract and tuple_extract expect guaranteed operand ownership
-    // non-trivial RunningVal is owned. Insert borrow operation to convert
-    if (projection.getKind() == ProjectionKind::Struct ||
-        projection.getKind() == ProjectionKind::Tuple) {
-      SILValue opVal = builder.emitBeginBorrowOperation(li->getLoc(), newValue);
-      if (opVal != newValue) {
-        borrowedVals.push_back(opVal);
-        newValue = opVal;
+    // non-trivial RunningVal is owned. Insert borrow operation to convert them
+    // to guaranteed!
+    if (proj.getKind() == ProjectionKind::Struct ||
+        proj.getKind() == ProjectionKind::Tuple) {
+      if (auto opVal = scope.borrowValue(li, newValue)) {
+        assert(*opVal != newValue &&
+               "Valid value should be different from input value");
+        newValue = *opVal;
       }
     }
     newValue =
-        projection.createObjectProjection(builder, li->getLoc(), newValue)
-            .get();
+        proj.createObjectProjection(builder, li->getLoc(), newValue).get();
   }
 
   op = li->getOperand();
+
   // Replace users of the loaded value with `val`
   // If we have a load [copy], replace the users with copy_value of `val`
   if (li->getOwnershipQualifier() == LoadOwnershipQualifier::Copy) {
@@ -181,9 +187,8 @@ static void replaceLoad(LoadInst *li, SILValue newValue, AllocStackInst *asi) {
     li->replaceAllUsesWith(newValue);
   }
 
-  for (auto borrowedVal : borrowedVals) {
-    builder.emitEndBorrowOperation(li->getLoc(), borrowedVal);
-  }
+  // Pop the scope so that we emit cleanups.
+  std::move(scope).popAtEndOfScope(&*builder.getInsertionPoint());
 
   // Delete the load
   li->eraseFromParent();
@@ -200,14 +205,16 @@ static void replaceLoad(LoadInst *li, SILValue newValue, AllocStackInst *asi) {
 
 /// Create a tuple value for an empty tuple or a tuple of empty tuples.
 static SILValue createValueForEmptyTuple(SILType ty,
-                                         SILInstruction *insertionPoint) {
+                                         SILInstruction *insertionPoint,
+                                         SILBuilderContext &ctx) {
   auto tupleTy = ty.castTo<TupleType>();
   SmallVector<SILValue, 4> elements;
   for (unsigned idx : range(tupleTy->getNumElements())) {
     SILType elementTy = ty.getTupleElementType(idx);
-    elements.push_back(createValueForEmptyTuple(elementTy, insertionPoint));
+    elements.push_back(
+        createValueForEmptyTuple(elementTy, insertionPoint, ctx));
   }
-  SILBuilderWithScope builder(insertionPoint);
+  SILBuilderWithScope builder(insertionPoint, ctx);
   return builder.createTuple(insertionPoint->getLoc(), ty, elements);
 }
 
@@ -219,7 +226,7 @@ namespace {
 
 /// Promotes a single AllocStackInst into registers..
 class StackAllocationPromoter {
-  using BlockSet = BasicBlockSetVector<16>;
+  using BlockSet = BasicBlockSetVector;
   using BlockToInstMap = llvm::DenseMap<SILBasicBlock *, SILInstruction *>;
 
   // Use a priority queue keyed on dominator tree level so that inserted nodes
@@ -242,8 +249,9 @@ class StackAllocationPromoter {
   /// Map from dominator tree node to tree level.
   DomTreeLevelMap &domTreeLevels;
 
-  /// The builder used to create new instructions during register promotion.
-  SILBuilder &b;
+  /// The SIL builder used when creating new instructions during register
+  /// promotion.
+  SILBuilderContext &ctx;
 
   /// Records the last store instruction in each block for a specific
   /// AllocStackInst.
@@ -253,9 +261,9 @@ public:
   /// C'tor.
   StackAllocationPromoter(AllocStackInst *inputASI, DominanceInfo *inputDomInfo,
                           DomTreeLevelMap &inputDomTreeLevels,
-                          SILBuilder &inputB)
+                          SILBuilderContext &inputCtx)
       : asi(inputASI), dsi(nullptr), domInfo(inputDomInfo),
-        domTreeLevels(inputDomTreeLevels), b(inputB) {
+        domTreeLevels(inputDomTreeLevels), ctx(inputCtx) {
     // Scan the users in search of a deallocation instruction.
     for (auto *use : asi->getUses()) {
       if (auto *foundDealloc = dyn_cast<DeallocStackInst>(use->getUser())) {
@@ -336,7 +344,7 @@ StoreInst *StackAllocationPromoter::promoteAllocationInBlock(
         // If we are loading from the AllocStackInst and we already know the
         // content of the Alloca then use it.
         LLVM_DEBUG(llvm::dbgs() << "*** Promoting load: " << *li);
-        replaceLoad(li, runningVal, asi);
+        replaceLoad(li, runningVal, asi, ctx);
         ++NumInstRemoved;
       } else if (li->getOperand() == asi &&
                  li->getOwnershipQualifier() != LoadOwnershipQualifier::Copy) {
@@ -361,9 +369,10 @@ StoreInst *StackAllocationPromoter::promoteAllocationInBlock(
       // simplifies further processing.
       if (si->getOwnershipQualifier() == StoreOwnershipQualifier::Assign) {
         if (runningVal) {
-          SILBuilderWithScope(si).createDestroyValue(si->getLoc(), runningVal);
+          SILBuilderWithScope(si, ctx).createDestroyValue(si->getLoc(),
+                                                          runningVal);
         } else {
-          SILBuilderWithScope localBuilder(si);
+          SILBuilderWithScope localBuilder(si, ctx);
           auto *newLoad = localBuilder.createLoad(si->getLoc(), asi,
                                                   LoadOwnershipQualifier::Take);
           localBuilder.createDestroyValue(si->getLoc(), newLoad);
@@ -395,14 +404,14 @@ StoreInst *StackAllocationPromoter::promoteAllocationInBlock(
     // promote this when we deal with hooking up phis.
     if (auto *dvai = dyn_cast<DebugValueAddrInst>(inst)) {
       if (dvai->getOperand() == asi && runningVal)
-        promoteDebugValueAddr(dvai, runningVal, b);
+        promoteDebugValueAddr(dvai, runningVal, ctx);
       continue;
     }
 
     // Replace destroys with a release of the value.
-    if (auto *DAI = dyn_cast<DestroyAddrInst>(inst)) {
-      if (DAI->getOperand() == asi && runningVal) {
-        replaceDestroy(DAI, runningVal);
+    if (auto *dai = dyn_cast<DestroyAddrInst>(inst)) {
+      if (dai->getOperand() == asi && runningVal) {
+        replaceDestroy(dai, runningVal, ctx);
       }
       continue;
     }
@@ -536,7 +545,7 @@ void StackAllocationPromoter::fixBranchesAndUses(BlockSet &phiBlocks) {
                  << "*** Replacing " << *li << " with Def " << *def);
 
       // Replace the load with the definition that we found.
-      replaceLoad(li, def, asi);
+      replaceLoad(li, def, asi, ctx);
       removedUser = true;
       ++NumInstRemoved;
     }
@@ -552,15 +561,15 @@ void StackAllocationPromoter::fixBranchesAndUses(BlockSet &phiBlocks) {
     if (auto *dvai = dyn_cast<DebugValueAddrInst>(user)) {
       // Replace DebugValueAddr with DebugValue.
       SILValue def = getLiveInValue(phiBlocks, userBlock);
-      promoteDebugValueAddr(dvai, def, b);
+      promoteDebugValueAddr(dvai, def, ctx);
       ++NumInstRemoved;
       continue;
     }
 
     // Replace destroys with a release of the value.
-    if (auto *DAI = dyn_cast<DestroyAddrInst>(user)) {
-      SILValue Def = getLiveInValue(phiBlocks, userBlock);
-      replaceDestroy(DAI, Def);
+    if (auto *dai = dyn_cast<DestroyAddrInst>(user)) {
+      SILValue def = getLiveInValue(phiBlocks, userBlock);
+      replaceDestroy(dai, def, ctx);
       continue;
     }
   }
@@ -701,10 +710,6 @@ void StackAllocationPromoter::promoteAllocationToPhi() {
     }
   }
 
-  LLVM_DEBUG(llvm::dbgs() << "*** Found: " << phiBlocks.size()
-                          << " new PHIs\n");
-  NumPhiPlaced += phiBlocks.size();
-
   // At this point we calculated the locations of all of the new Phi values.
   // Next, add the Phi values and promote all of the loads and stores into the
   // new locations.
@@ -736,14 +741,48 @@ namespace {
 
 /// Promote memory to registers
 class MemoryToRegisters {
+  /// Lazily initialized map from DomTreeNode to DomTreeLevel.
+  ///
+  /// DomTreeLevelMap is a DenseMap implying that if we initialize it, we always
+  /// will initialize a heap object with 64 objects. Thus by using an optional,
+  /// computing this lazily, we only do this if we actually need to do so.
+  Optional<DomTreeLevelMap> domTreeLevels;
+
   /// The function that we are optimizing.
   SILFunction &f;
 
   /// Dominators.
   DominanceInfo *domInfo;
 
-  /// The builder used to create new instructions during register promotion.
-  SILBuilder b;
+  /// The builder context used when creating new instructions during register
+  /// promotion.
+  SILBuilderContext ctx;
+
+  /// Returns the dom tree levels for the current function. Computes these
+  /// lazily.
+  DomTreeLevelMap &getDomTreeLevels() {
+    // If we already computed our levels, just return it.
+    if (auto &levels = domTreeLevels) {
+      return *levels;
+    }
+
+    // Otherwise, emplace the map and compute it.
+    domTreeLevels.emplace();
+    auto &levels = *domTreeLevels;
+    SmallVector<DomTreeNode *, 32> worklist;
+    DomTreeNode *rootNode = domInfo->getRootNode();
+    levels[rootNode] = 0;
+    worklist.push_back(rootNode);
+    while (!worklist.empty()) {
+      DomTreeNode *domNode = worklist.pop_back_val();
+      unsigned childLevel = levels[domNode] + 1;
+      for (auto *childNode : domNode->children()) {
+        levels[childNode] = childLevel;
+        worklist.push_back(childNode);
+      }
+    }
+    return *domTreeLevels;
+  }
 
   /// Check if the AllocStackInst \p ASI is only written into.
   bool isWriteOnlyAllocation(AllocStackInst *asi);
@@ -757,13 +796,12 @@ class MemoryToRegisters {
   /// Attempt to promote the specified stack allocation, returning true if so
   /// or false if not.  On success, all uses of the AllocStackInst have been
   /// removed, but the ASI itself is still in the program.
-  bool promoteSingleAllocation(AllocStackInst *asi,
-                               DomTreeLevelMap &domTreeLevels);
+  bool promoteSingleAllocation(AllocStackInst *asi);
 
 public:
   /// C'tor
   MemoryToRegisters(SILFunction &inputFunc, DominanceInfo *inputDomInfo)
-      : f(inputFunc), domInfo(inputDomInfo), b(inputFunc) {}
+      : f(inputFunc), domInfo(inputDomInfo), ctx(inputFunc.getModule()) {}
 
   /// Promote memory to registers. Return True on change.
   bool run();
@@ -925,9 +963,9 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *asi) {
       if (!runningVal) {
         // Loading without a previous store is only acceptable if the type is
         // Void (= empty tuple) or a tuple of Voids.
-        runningVal = createValueForEmptyTuple(asi->getElementType(), inst);
+        runningVal = createValueForEmptyTuple(asi->getElementType(), inst, ctx);
       }
-      replaceLoad(cast<LoadInst>(inst), runningVal, asi);
+      replaceLoad(cast<LoadInst>(inst), runningVal, asi, ctx);
       ++NumInstRemoved;
       continue;
     }
@@ -938,7 +976,8 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *asi) {
       if (si->getDest() == asi) {
         if (si->getOwnershipQualifier() == StoreOwnershipQualifier::Assign) {
           assert(runningVal);
-          SILBuilderWithScope(si).createDestroyValue(si->getLoc(), runningVal);
+          SILBuilderWithScope(si, ctx).createDestroyValue(si->getLoc(),
+                                                          runningVal);
         }
         runningVal = si->getSrc();
         inst->eraseFromParent();
@@ -951,7 +990,7 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *asi) {
     if (auto *dvai = dyn_cast<DebugValueAddrInst>(inst)) {
       if (dvai->getOperand() == asi) {
         if (runningVal) {
-          promoteDebugValueAddr(dvai, runningVal, b);
+          promoteDebugValueAddr(dvai, runningVal, ctx);
         } else {
           // Drop debug_value_addr of uninitialized void values.
           assert(asi->getElementType().isVoid() &&
@@ -963,9 +1002,9 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *asi) {
     }
 
     // Replace destroys with a release of the value.
-    if (auto *DAI = dyn_cast<DestroyAddrInst>(inst)) {
-      if (DAI->getOperand() == asi) {
-        replaceDestroy(DAI, runningVal);
+    if (auto *dai = dyn_cast<DestroyAddrInst>(inst)) {
+      if (dai->getOperand() == asi) {
+        replaceDestroy(dai, runningVal, ctx);
       }
       continue;
     }
@@ -994,30 +1033,11 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *asi) {
   }
 }
 
-/// Compute the dominator tree levels for domInfo.
-static void computeDomTreeLevels(DominanceInfo *domInfo,
-                                 DomTreeLevelMap &domTreeLevels) {
-  // TODO: This should happen once per function.
-  SmallVector<DomTreeNode *, 32> worklist;
-  DomTreeNode *rootNode = domInfo->getRootNode();
-  domTreeLevels[rootNode] = 0;
-  worklist.push_back(rootNode);
-  while (!worklist.empty()) {
-    DomTreeNode *domNode = worklist.pop_back_val();
-    unsigned childLevel = domTreeLevels[domNode] + 1;
-    for (auto *childNode : domNode->children()) {
-      domTreeLevels[childNode] = childLevel;
-      worklist.push_back(childNode);
-    }
-  }
-}
-
 /// Attempt to promote the specified stack allocation, returning true if so
 /// or false if not.  On success, this returns true and usually drops all of the
 /// uses of the AllocStackInst, but never deletes the ASI itself.  Callers
 /// should check to see if the ASI is dead after this and remove it if so.
-bool MemoryToRegisters::promoteSingleAllocation(
-    AllocStackInst *alloc, DomTreeLevelMap &domTreeLevels) {
+bool MemoryToRegisters::promoteSingleAllocation(AllocStackInst *alloc) {
   LLVM_DEBUG(llvm::dbgs() << "*** Memory to register looking at: " << *alloc);
   ++NumAllocStackFound;
 
@@ -1048,16 +1068,19 @@ bool MemoryToRegisters::promoteSingleAllocation(
       // This can come up if the source contains a withUnsafePointer where
       // the pointer escapes. It's illegal code but we should not crash.
       // Re-insert a dealloc_stack so that the verifier is happy.
-      b.setInsertionPoint(std::next(alloc->getIterator()));
-      b.createDeallocStack(alloc->getLoc(), alloc);
+      auto *next = alloc->getNextInstruction();
+      SILBuilderWithScope b(next, ctx);
+      b.createDeallocStack(next->getLoc(), alloc);
     }
     return true;
   }
 
   LLVM_DEBUG(llvm::dbgs() << "*** Need to insert BB arguments for " << *alloc);
 
-  // Promote this allocation.
-  StackAllocationPromoter(alloc, domInfo, domTreeLevels, b).run();
+  // Promote this allocation, lazily computing dom tree levels for this function
+  // if we have not done so yet.
+  auto &domTreeLevels = getDomTreeLevels();
+  StackAllocationPromoter(alloc, domInfo, domTreeLevels, ctx).run();
 
   // Make sure that all of the allocations were promoted into registers.
   assert(isWriteOnlyAllocation(alloc) && "Non-write uses left behind");
@@ -1072,10 +1095,6 @@ bool MemoryToRegisters::run() {
   if (f.getModule().getOptions().VerifyAll)
     f.verifyCriticalEdges();
 
-  // Compute dominator tree node levels for the function.
-  DomTreeLevelMap domTreeLevels;
-  computeDomTreeLevels(domInfo, domTreeLevels);
-
   for (auto &block : f) {
     auto ii = block.begin(), ie = block.end();
     while (ii != ie) {
@@ -1086,7 +1105,7 @@ bool MemoryToRegisters::run() {
         continue;
       }
 
-      bool promoted = promoteSingleAllocation(asi, domTreeLevels);
+      bool promoted = promoteSingleAllocation(asi);
       ++ii;
       if (promoted) {
         if (asi->use_empty())
@@ -1106,7 +1125,6 @@ bool MemoryToRegisters::run() {
 namespace {
 
 class SILMem2Reg : public SILFunctionTransform {
-
   void run() override {
     SILFunction *f = getFunction();
 

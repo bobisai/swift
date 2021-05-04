@@ -14,7 +14,7 @@ actor MyActor {
   }
 
   // CHECK-LABEL: sil hidden [ossa] @$s4test7MyActorC14throwingCalleeyySiYaKF : $@convention(method) @async (Int, @guaranteed MyActor) -> @error Error {
-  // CHECK-NOT:   hop_to_executor
+  // CHECK-NOT:   hop_to_executor{{ }}
   // CHECK:     } // end sil function '$s4test7MyActorC14throwingCalleeyySiYaKF'
   nonisolated func throwingCallee(_ x: Int) async throws {
     print(x)
@@ -171,7 +171,7 @@ struct BlueActor {
 }
 
 // CHECK-LABEL: sil hidden [ossa] @$s4test5redFnyySiF : $@convention(thin) (Int) -> () {
-// CHECK-NOT: hop_to_executor
+// CHECK-NOT: hop_to_executor{{ }}
 // CHECK: } // end sil function '$s4test5redFnyySiF'
 @RedActor func redFn(_ x : Int) {}
 
@@ -235,4 +235,30 @@ func unspecifiedAsyncFunc() async {
 // CHECK: } // end sil function '$s4test27anotherUnspecifiedAsyncFuncyyAA12RedActorImplCYaF'
 func anotherUnspecifiedAsyncFunc(_ red : RedActorImpl) async {
   await red.hello(12);
+}
+
+// CHECK-LABEL: sil hidden [ossa] @$s4test0A20GlobalActorFuncValueyyyyXEYaF
+// CHECK: function_ref @$s4test8RedActorV6sharedAA0bC4ImplCvgZ
+// CHECK: hop_to_executor [[RED:%[0-9]+]] : $RedActorImpl
+// CHECK-NEXT: apply
+// CHECK-NEXT: hop_to_executor [[PREV:%[0-9]+]] : $Optional<Builtin.Executor>
+func testGlobalActorFuncValue(_ fn: @RedActor () -> Void) async {
+  await fn()
+}
+
+func acceptAsyncSendableClosureInheriting<T>(@_inheritActorContext _: @Sendable () async -> T) { }
+
+extension MyActor {
+  func synchronous() { }
+
+  // CHECK-LABEL: sil private [ossa] @$s4test7MyActorC0A10InheritingyyFyyYaYbXEfU_
+  // CHECK: debug_value [[SELF:%[0-9]+]] : $MyActor
+  // CHECK-NEXT: [[COPY:%[0-9]+]] = copy_value [[SELF]] : $MyActor
+  // CHECK-NEXT: [[BORROW:%[0-9]+]] = begin_borrow [[COPY]] : $MyActor
+  // CHECK-NEXT: hop_to_executor [[BORROW]] : $MyActor
+  func testInheriting() {
+    acceptAsyncSendableClosureInheriting {
+      synchronous()
+    }
+  }
 }

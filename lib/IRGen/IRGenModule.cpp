@@ -618,8 +618,9 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
 
   AsyncFunctionPointerPtrTy = AsyncFunctionPointerTy->getPointerTo(DefaultAS);
   SwiftTaskPtrTy = SwiftTaskTy->getPointerTo(DefaultAS);
+  SwiftAsyncLetPtrTy = Int8PtrTy; // we pass it opaquely (AsyncLet*)
   SwiftTaskGroupPtrTy = Int8PtrTy; // we pass it opaquely (TaskGroup*)
-  ExecutorFirstTy = RefCountedPtrTy;
+  ExecutorFirstTy = SizeTy;
   ExecutorSecondTy = SizeTy;
   SwiftExecutorTy = createStructType(*this, "swift.executor", {
     ExecutorFirstTy,      // identity
